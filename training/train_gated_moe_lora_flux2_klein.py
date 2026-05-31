@@ -31,7 +31,12 @@ import json
 import inspect
 import argparse
 import os
+import sys
 import inspect as _inspect
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
@@ -65,6 +70,41 @@ try:
 except Exception:
     pass
 # ───────────────────────────────────────────────────────────────────────────
+
+from visual_analogy.models.selective_lora import BaseLoRALinear
+from visual_analogy.models.moe_lora import TokenWiseGatedMoELoraLinear
+from visual_analogy.utils.selective_lora import (
+    inject_base_lora_modules,
+    save_base_lora_state_dict,
+    collect_base_lora_params,
+)
+from visual_analogy.utils.moe_lora import (
+    inject_moe_lora_modules,
+    save_moe_lora_state_dict,
+    collect_moe_lora_params,
+    collect_moe_aux_losses,
+)
+
+# ---------------------------------------------------------------------------
+# MoE LoRA target modules: image-stream MLP output (analogous to VIRAL's
+# img_mlp.net.2).  Override via YAML key "moe_target_modules".
+# ---------------------------------------------------------------------------
+MOE_LORA_TARGET_MODULES_DEFAULT = ["ff.net.2"]
+
+LORA_TARGET_MODULES_ALL = [
+    "attn.to_k",
+    "attn.to_q",
+    "attn.to_v",
+    "attn.to_out.0",
+    "attn.add_k_proj",
+    "attn.add_q_proj",
+    "attn.add_v_proj",
+    "attn.to_add_out",
+    "ff.net.0.proj",
+    "ff.net.2",
+    "ff_context.net.0.proj",
+    "ff_context.net.2",
+]
 
 
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
@@ -648,8 +688,14 @@ def parse_args(print_args=False):
         required=True,
         help="path to config",
     )
+    cli = parser.parse_args()
+    args = OmegaConf.load(cli.config)
 
-    args = OmegaConf.load(parser.parse_args().config)
+    # CLI --use_MoE overrides the YAML value
+    if cli.use_MoE:
+        args.use_MoE = True
+    elif not hasattr(args, "use_MoE"):
+        args.use_MoE = False
 
     if print_args:
         print("="*40, "Arguments", "="*40)
@@ -700,38 +746,80 @@ def main():
 
     transformer.enable_gradient_checkpointing()
 
-    LORA_TARGET_MODULES = [
-        "attn.to_k",
-        "attn.to_q",
-        "attn.to_v",
-        "attn.to_out.0",
-        "attn.add_k_proj",
-        "attn.add_q_proj",
-        "attn.add_v_proj",
-        "attn.to_add_out",
-        "ff.net.0.proj",
-        "ff.net.2",
-        "ff_context.net.0.proj",
-        "ff_context.net.2",
+    # Resolve MoE config 
+    use_moe = bool(getattr(args, "use_MoE", False))
+    moe_target_modules: list[str] = list(
+        getattr(args, "moe_target_modules", MOE_LORA_TARGET_MODULES_DEFAULT)
+    )
+    moe_lora_rank= int(getattr(args, "moe_lora_rank", args.lora_rank))
+    moe_lora_alpha= float(getattr(args, "moe_lora_alpha", moe_lora_rank))
+    num_experts= int(getattr(args, "num_experts", 4))
+    moe_top_k= int(getattr(args, "moe_top_k", 1))
+    moe_aux_loss_weight = float(getattr(args, "moe_aux_loss_weight", 0.005))
+
+
+    print(f"[MoE LoRA] Enabled — targets: {moe_target_modules}, "
+            f"experts={num_experts}, rank={moe_lora_rank}, top_k={moe_top_k}")
+
+    # ---- Base LoRA: inject BaseLoRALinear on all modules EXCEPT MoE targets ----
+    base_only_modules = [
+        m for m in LORA_TARGET_MODULES_ALL
+        if not any(m.endswith(sfx) for sfx in moe_target_modules)
     ]
-    args.lora_name = "visual-analogy-gstlora"
-    add_lora(transformer, args, LORA_TARGET_MODULES)
+    base_replaced = inject_base_lora_modules(
+        transformer, base_only_modules,
+        r=args.lora_rank, alpha=args.lora_rank,
+        dropout=getattr(args, "lora_dropout", 0.0),
+    )
+    print(f"[Base LoRA] Injected {len(base_replaced)} BaseLoRALinear modules")
 
-    accelerator.register_save_state_pre_hook(
-        get_save_model_hook(accelerator, args))
+    # ---- MoE LoRA: injected on the remaining target layers ----
+    moe_replaced = inject_moe_lora_modules(
+        transformer, moe_target_modules,
+        num_experts=num_experts,
+        r=moe_lora_rank,
+        lora_alpha=moe_lora_alpha,
+        lora_dropout=getattr(args, "lora_dropout", 0.0),
+        top_k=moe_top_k,
+    )
+    print(f"[MoE LoRA] Injected {len(moe_replaced)} TokenWiseGatedMoELoraLinear modules:")
+    for name in moe_replaced:
+        print(f"  {name}")
 
-    # Make sure the trainable params are in float32. [only upcast trainable parameters (LoRA) into fp32]
+    # ---- Save hook: base_lora.pt + moe_lora.pt ----
+    def _save_moe_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            for model in models:
+                unwrapped = accelerator.unwrap_model(model)
+                if isinstance(unwrapped, Flux2Transformer2DModel):
+                    save_base_lora_state_dict(
+                        unwrapped,
+                        os.path.join(output_dir, "base_lora.pt"),
+                    )
+                    save_moe_lora_state_dict(
+                        unwrapped,
+                        os.path.join(output_dir, "moe_lora.pt"),
+                    )
+                    weights.pop()
+
+    accelerator.register_save_state_pre_hook(_save_moe_hook)
+
     cast_training_params([transformer], dtype=torch.float32)
 
-    transformer_lora_parameters = list(
-        filter(lambda p: p.requires_grad, transformer.parameters()))
-    optimizer = torch.optim.AdamW(  # TODO: Change to prodigy
-        [{"params": transformer_lora_parameters, "lr": args.learning_rate}],
+    # ---- Optimizer: BaseLoRALinear params + MoE gate/expert params ----
+    base_lora_params = collect_base_lora_params(transformer)
+    moe_params       = collect_moe_lora_params(transformer)
+    all_trainable    = base_lora_params + moe_params
+    print(f"[Optimizer] base LoRA params: {len(base_lora_params)}, MoE params: {len(moe_params)}")
+
+    optimizer = torch.optim.AdamW(
+        [{"params": all_trainable, "lr": args.learning_rate}],
         betas=(0.9, 0.999),
-        weight_decay=1e-04,
-        eps=1e-08,
+        weight_decay=1e-4,
+        eps=1e-8,
     )
 
+    # Making Dataset and Loaders 
     analogy_mode = getattr(args, 'analogy_mode', 'concat')
     args.analogy_mode = analogy_mode
     train_dataset = ImageAnalogyDataset(args.data_root, mode=analogy_mode)
@@ -872,7 +960,7 @@ def main():
                     # Grid mode: single grid, conditions embedded spatially
                     latent_model_input = noisy_model_input
 
-                transformer.set_adapters([args.lora_name], [1])
+                # Get the models ouput for B'(in the grid mode, the whole grid but loss only on B' via masking)
                 model_pred = transformer(
                     hidden_states=latent_model_input,
                     timestep=timesteps / 1000,
@@ -882,6 +970,7 @@ def main():
                     img_ids=combined_ids,
                     return_dict=False,
                 )[0]
+
                 if condition_latents is not None:
                     model_pred = model_pred[:, :noisy_model_input.shape[1]]
 
@@ -901,6 +990,13 @@ def main():
                     1,
                 )
                 loss = loss.mean()
+
+                # MoE load-balancing aux loss
+                if use_moe:
+                    _unwrapped = accelerator.unwrap_model(transformer)
+                    moe_aux = collect_moe_aux_losses(_unwrapped)
+                    if moe_aux is not None:
+                        loss = loss + moe_aux_loss_weight * moe_aux
 
                 accelerator.backward(loss)
 

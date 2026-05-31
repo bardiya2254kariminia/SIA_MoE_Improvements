@@ -1,0 +1,69 @@
+tracker_name: visual-analogy
+wandb_run_name: "gated_moe_lora_flux2_klein_analogy"
+
+output_dir: "/workspace/visual_analogy/experiments/gated_moe_lora_flux2_klein_analogy"
+
+pretrained_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+
+data_root: "/workspace/visual_analogy/data"
+
+seed: 0
+checkpointing_steps: 500
+validation_steps: 20
+
+# validation_lora_scales: [-1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5]
+validation_lora_scales: [-1, -0.5, 0, 0.5, 1]
+num_val_inference_steps: 28
+
+lora_rank: 16
+lora_dropout: 0.0
+lora_name: "visual-analogy-lora"
+
+
+# MoE LoRA configuration (only used when --use_MoE is passed or use_MoE: true)
+# ****must be set to True Always*****
+use_MoE: True
+
+# Layers that get TokenWiseGatedMoELoraLinear (image-stream MLP output,
+# analogous to VIRAL's img_mlp.net.2). These are excluded from BaseLoRALinear.
+moe_target_modules:
+  - "attn.to_k"
+  -  "attn.to_q"
+  -  "attn.to_v"
+  -  "attn.to_out.0"
+  -  "attn.add_k_proj"
+  -  "attn.add_q_proj"
+  -  "attn.add_v_proj"
+  -  "attn.to_add_out"
+  -  "ff.net.0.proj"
+  -  "ff.net.2"
+  -  "ff_context.net.0.proj"
+  -  "ff_context.net.2"
+
+# MoE-specific LoRA rank and alpha (can differ from the base lora_rank)
+moe_lora_rank: 16
+moe_lora_alpha: 16.0
+
+# Number of experts and top-k routing per token
+num_experts: 6
+moe_top_k: 3
+
+# Weight for the Switch-Transformer load-balancing auxiliary loss
+moe_aux_loss_weight: 0.005
+
+# ========================================================================
+resume_from_checkpoint: false
+max_train_steps: 50000
+
+lr_warmup_steps: 0
+learning_rate: 5e-5
+train_batch_size: 16
+gradient_accumulation_steps: 1
+# guidance_scale is unused for Klein (Klein does not support CFG guidance)
+max_grad_norm: 1
+# Timestep sampling range — keep aligned with scheduler's 1000 steps
+max_train_timesteps: 1000
+min_train_timesteps: 0
+
+# Ablation: "concat" (default, separate images T=10/20/30) or "grid" (2x2 spatial grid)
+analogy_mode: "concat"

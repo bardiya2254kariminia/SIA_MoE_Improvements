@@ -80,6 +80,8 @@ from visual_analogy.utils.selective_lora import (
     inject_selective_lora_modules,
     inject_base_lora_modules,
     load_base_lora_from_peft_checkpoint,
+    save_base_lora_state_dict,
+    load_base_lora_state_dict,
     collect_base_lora_params,
     collect_stlora_params,
     set_base_lora_requires_grad,
@@ -201,7 +203,7 @@ def retrieve_timesteps(scheduler, num_inference_steps=None, device=None,
 
 
 # ---------------------------------------------------------------------------
-# Base LoRA target modules (same as simple_lora training)
+# Base LoRA,MoE LoRA target modules (same as simple_lora training)
 # ---------------------------------------------------------------------------
 BASE_LORA_TARGET_MODULES = [
     "attn.to_k", "attn.to_q", "attn.to_v", "attn.to_out.0",
@@ -211,13 +213,6 @@ BASE_LORA_TARGET_MODULES = [
     "ff_context.net.0.proj", "ff_context.net.2",
 ]
 
-# ---------------------------------------------------------------------------
-# MoE LoRA target modules: image-stream MLP output layers.
-# Analogous to VIRAL's img_mlp.net.2 on Qwen-Image-Edit.
-# When use_MoE=True these get TokenWiseGatedMoELoraLinear instead of
-# BaseLoRALinear, and are excluded from the BASE_LORA injection.
-# Override via YAML key "moe_target_modules" if needed.
-# ---------------------------------------------------------------------------
 MOE_LORA_TARGET_MODULES_DEFAULT = ["ff.net.2"]
 
 # ---------------------------------------------------------------------------
@@ -677,7 +672,6 @@ def get_save_model_hook(accelerator):
                         unwrapped,
                         os.path.join(output_dir, "base_lora.pt"),
                     )
-                    # Save MoE weights if any MoE modules are present
                     if any(isinstance(m, TokenWiseGatedMoELoraLinear)
                            for m in unwrapped.modules()):
                         save_moe_lora_state_dict(
@@ -1112,7 +1106,7 @@ def main():
 
     set_seed(args.seed)
 
-    # ---- Load models ----
+    # Load models
     tokenizer, text_encoder, vae, transformer, noise_scheduler = load_models(args)
 
     for m in [text_encoder, vae, transformer]:
@@ -1122,17 +1116,17 @@ def main():
     for m in [text_encoder, vae, transformer]:
         m.to(accelerator.device, dtype=weight_dtype)
 
-    # ---- Resolve MoE config ----
-    use_moe: bool = bool(getattr(args, "use_MoE", False))
-    moe_target_modules: list[str] = list(
+    # Resolve MoE config
+    use_moe= bool(getattr(args, "use_MoE", False))
+    moe_target_modules = list(
         getattr(args, "moe_target_modules", MOE_LORA_TARGET_MODULES_DEFAULT)
     )
-    moe_lora_rank: int = int(getattr(args, "moe_lora_rank", args.lora_rank))
-    moe_lora_alpha: float = float(getattr(args, "moe_lora_alpha", moe_lora_rank))
-    num_experts: int = int(getattr(args, "num_experts", 4))
-    moe_top_k: int = int(getattr(args, "moe_top_k", 1))
-    moe_aux_loss_weight: float = float(getattr(args, "moe_aux_loss_weight", 0.005))
-    moe_lora_lr: float = float(
+    moe_lora_rank = int(getattr(args, "moe_lora_rank", args.lora_rank))
+    moe_lora_alpha = float(getattr(args, "moe_lora_alpha", moe_lora_rank))
+    num_experts = int(getattr(args, "num_experts", 4))
+    moe_top_k = int(getattr(args, "moe_top_k", 1))
+    moe_aux_loss_weight = float(getattr(args, "moe_aux_loss_weight", 0.005))
+    moe_lora_lr = float(
         getattr(args, "moe_lora_learning_rate",
                 getattr(args, "learning_rate", 5e-5))
     )
@@ -1148,14 +1142,14 @@ def main():
     else:
         base_only_modules = BASE_LORA_TARGET_MODULES
 
-    # ---- Inject BaseLoRALinear on ALL base LoRA target modules ----
+    # Inject BaseLoRALinear on ALL base LoRA target modules
     base_replaced = inject_base_lora_modules(
         transformer, base_only_modules,
         r=args.lora_rank, alpha=args.lora_rank, dropout=0.0,
     )
     print(f"[Base LoRA] Injected {len(base_replaced)} BaseLoRALinear modules")
 
-    # ---- Inject MoE LoRA on image-stream MLP layers (use_MoE only) ----
+    # Inject MoE LoRA on image-stream MLP layers (use_MoE only)
     if use_moe:
         moe_replaced = inject_moe_lora_modules(
             transformer, moe_target_modules,
@@ -1169,11 +1163,38 @@ def main():
         for name in moe_replaced:
             print(f"  {name}")
 
-    # ---- Load pre-trained base LoRA weights from PEFT checkpoint ----
-    #      When Stage-1 ran with use_MoE=True the checkpoint dir also
-    #      contains moe_lora.pt alongside base_lora.pt.
-    load_base_lora_from_peft_checkpoint(
-        transformer, args.base_lora_path, device="cpu")
+    # Load pre-trained base LoRA weights 
+    # Two possible Stage-1 checkpoint formats:
+    #
+    #   A) Custom format  (train_gated_moe_lora_flux2_klein.py with use_MoE=True)
+    #      checkpoint-N/base_lora.pt   ← BaseLoRALinear weights
+    #      checkpoint-N/moe_lora.pt    ← TokenWiseGatedMoELoraLinear weights
+    #      → load with load_base_lora_state_dict()
+    #
+    #   B) PEFT format  (train_simple_lora_flux2_klein.py with use_MoE=False)
+    #      checkpoint-N/pytorch_lora_weights.safetensors
+    #      → load with load_base_lora_from_peft_checkpoint()
+    #
+    # Custom format takes priority; PEFT is a fallback for non-MoE Stage-1 runs.
+    # ---------------------------------------------------------------------------------
+    _custom_base_ckpt = os.path.join(args.base_lora_path, "base_lora.pt")
+    _peft_sf_ckpt     = os.path.join(args.base_lora_path, "pytorch_lora_weights.safetensors")
+    _peft_bin_ckpt    = os.path.join(args.base_lora_path, "pytorch_lora_weights.bin")
+
+    if os.path.exists(_custom_base_ckpt):
+        print(f"[Base LoRA] Detected custom format checkpoint, loading from {_custom_base_ckpt}")
+        load_base_lora_state_dict(transformer, _custom_base_ckpt, device="cpu")
+    elif os.path.exists(_peft_sf_ckpt) or os.path.exists(_peft_bin_ckpt):
+        print(f"[Base LoRA] Detected PEFT format checkpoint, loading from {args.base_lora_path}")
+        load_base_lora_from_peft_checkpoint(transformer, args.base_lora_path, device="cpu")
+    else:
+        raise FileNotFoundError(
+            f"[Base LoRA] No recognised checkpoint found in '{args.base_lora_path}'.\n"
+            f"  Expected one of:\n"
+            f"    {_custom_base_ckpt}  (from train_gated_moe_lora_flux2_klein.py)\n"
+            f"    {_peft_sf_ckpt}  (from train_simple_lora_flux2_klein.py)\n"
+            f"  Point base_lora_path at the checkpoint-N directory, not its parent."
+        )
 
     if use_moe:
         base_moe_ckpt = os.path.join(args.base_lora_path, "moe_lora.pt")
@@ -1181,9 +1202,9 @@ def main():
             print(f"[MoE LoRA] Loading pre-trained MoE weights from {base_moe_ckpt}")
             load_moe_lora_state_dict(transformer, base_moe_ckpt, device="cpu")
         else:
-            print("[MoE LoRA] No pre-trained MoE checkpoint — starting from random init.")
+            print("[MoE LoRA] No moe_lora.pt found — MoE experts start from random init.")
 
-    # ---- Inject STLoRA on context targets (wraps BaseLoRALinear where applicable) ----
+    # Inject STLoRA on context targets (wraps BaseLoRALinear where applicable)
     replaced = inject_selective_lora_modules(
         transformer, STLORA_TARGET_MODULES,
         r=args.lora_rank, alpha=args.lora_rank, dropout=args.lora_dropout,
@@ -1192,21 +1213,21 @@ def main():
     for name in replaced:
         print(f"  {name}")
 
-    # ---- Optionally initialise STLoRA from a PEFT checkpoint ----
+    # Optionally initialise STLoRA from a PEFT checkpoint 
     init_ckpt = getattr(args, "init_from_lora_ckpt", None)
     if init_ckpt:
         load_peft_ckpt_into_stlora(transformer, init_ckpt, accelerator.device)
 
     transformer.enable_gradient_checkpointing()
 
-    # ---- Register Accelerate save/load hooks ----
+    # Register Accelerate save/load hooks ----
     accelerator.register_save_state_pre_hook(get_save_model_hook(accelerator))
     accelerator.register_load_state_pre_hook(get_load_model_hook(accelerator))
 
-    # ---- Keep LoRA params in float32 ----
+    # Keep LoRA params in float32 ----
     cast_training_params([transformer], dtype=torch.float32)
 
-    # ---- Snapshot base LoRA weights as L2 anchor (prevents drift) ----
+    # Snapshot base LoRA weights as L2 anchor (prevents drift) 
     base_lora_anchor = {}
     for mod_name, mod in transformer.named_modules():
         if isinstance(mod, BaseLoRALinear):
@@ -1216,7 +1237,7 @@ def main():
     print(f"[L2 Anchor] Saved {len(base_lora_anchor)} base LoRA param tensors, "
           f"λ = {base_lora_anchor_weight}")
 
-    # ---- Two optimizer param groups: STLoRA (normal LR) + base LoRA (low LR) ----
+    # Two optimizer param groups: STLoRA (normal LR) + base LoRA (low LR) 
     base_lora_lr = getattr(args, "base_lora_learning_rate", 5e-6)
     stlora_params = collect_stlora_params(transformer)
     base_lora_params = collect_base_lora_params(transformer)
@@ -1261,7 +1282,7 @@ def main():
         transformer, optimizer, train_dataloader, lr_scheduler
     )
 
-    # ---- Optionally restore optimizer/scheduler/RNG from init checkpoint ----
+    #  Optionally restore optimizer/scheduler/RNG from init checkpoint 
     # init_ckpt = getattr(args, "init_from_lora_ckpt", None)
     if init_ckpt and getattr(args, "init_optimizer_from_ckpt", False):
         restore_training_state(optimizer, lr_scheduler, init_ckpt, accelerator.device)
@@ -1282,7 +1303,7 @@ def main():
     global_step  = 0
     first_epoch  = 0
 
-    # ---- Resume from STLoRA checkpoint ----
+    # Resume from STLoRA checkpoint 
     if args.resume_from_checkpoint:
         dirs = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
         dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
@@ -1304,7 +1325,7 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    # ---- Build pipeline for VAE encoding & validation ----
+    # Build pipeline for VAE encoding & validation 
     pipeline = Flux2KleinPipeline(
         scheduler=noise_scheduler,
         vae=vae,
@@ -1329,7 +1350,7 @@ def main():
                 pair_a_edits = batch['pair_a_edits']  # List[List[str]]
                 pair_b_edits = batch['pair_b_edits']
 
-                # ---- Decide step type ----
+                # Decide step type 
                 # Distribution (single draw):
                 #   [0.00, 0.25) → base LoRA partial  (25 %)
                 #   [0.25, 0.55) → base LoRA total    (30 %)
@@ -1341,7 +1362,7 @@ def main():
                 use_total_change       = 0.25 <= _r < 0.55   # base LoRA total only
                 is_base_lora_partial   = is_base_lora_step and not use_total_change
 
-                # ---- Toggle trainability ----
+                # Toggle trainability 
                 if is_base_lora_step:
                     set_stlora_requires_grad(unwrapped_transformer, False)
                     set_base_lora_requires_grad(unwrapped_transformer, True)
@@ -1357,7 +1378,7 @@ def main():
                         # experts remain consistent with the selective token masking.
                         set_moe_lora_requires_grad(unwrapped_transformer, True)
 
-                # ---- Choose target image ----
+                # Choose target image 
                 # Base-LoRA-partial also swaps A_prime to the matched partial
                 # (same "kept edit" as B_prime).  Falls back to A_total where
                 # the matched partial is unavailable for a given sample.
@@ -1378,7 +1399,7 @@ def main():
                 else:
                     target_batch = batch
 
-                # ---- Encode images (concat mode) ----
+                # Encode images (concat mode) 
                 target_latents, condition_latents, target_ids, condition_ids = \
                     prepare_analogy_latents(pipeline, target_batch,
                                            resolution=args.get("resolution", 512))
@@ -1391,7 +1412,7 @@ def main():
                 condition_ids = condition_ids.expand(bsz, -1, -1)
                 combined_ids  = torch.cat([target_ids, condition_ids], dim=1)
 
-                # ---- Sample timestep and add noise ----
+                # Sample timestep and add noise 
                 u = compute_density_for_timestep_sampling("none", batch_size=bsz)
                 indices = (
                     u * (args.max_train_timesteps - args.min_train_timesteps)
@@ -1497,7 +1518,7 @@ def main():
                         )
                         tokens_mask[i] = single_mask[0]
 
-                    # ---- Forward with STLoRA active + token mask ----
+                    # Forward with STLoRA active + token mask 
                     with stlora_token_mask_ctx(transformer, tokens_mask, disable_mask_after=False):
                         model_pred = transformer(
                             hidden_states=latent_model_input,
@@ -1518,7 +1539,7 @@ def main():
                         dim=1,
                     ).mean()
 
-                # ---- L2 anchor: prevent base LoRA drift on base_lora steps ----
+                # L2 anchor: prevent base LoRA drift on base_lora steps 
                 if is_base_lora_step and base_lora_anchor_weight > 0:
                     anchor_loss = torch.tensor(0.0, device=device)
                     for mod_name, mod in unwrapped_transformer.named_modules():
@@ -1532,7 +1553,7 @@ def main():
                     print("loss before anchor:", loss.item())
                     loss = loss + base_lora_anchor_weight * anchor_loss
 
-                # ---- MoE load-balancing aux loss ----
+                # MoE load-balancing aux loss 
                 if use_moe:
                     moe_aux = collect_moe_aux_losses(unwrapped_transformer)
                     if moe_aux is not None:
@@ -1547,7 +1568,7 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # ---- After gradient sync ----
+            # After gradient sync 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1

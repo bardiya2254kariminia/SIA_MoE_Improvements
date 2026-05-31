@@ -1,32 +1,9 @@
-"""
-utils/moe_lora.py
-
-Utilities for injecting, saving, loading, and collecting parameters from
-TokenWiseGatedMoELoraLinear modules inside a FLUX.2-Klein transformer.
-
-Public API
-----------
-inject_moe_lora_modules        – replace target nn.Linear modules with MoE LoRA
-save_moe_lora_state_dict       – checkpoint gate + expert weights
-load_moe_lora_state_dict       – restore from that checkpoint
-collect_moe_lora_params        – list of all trainable MoE parameters
-collect_moe_aux_losses         – average aux loss across all MoE modules
-set_moe_lora_requires_grad     – toggle requires_grad on MoE parameters
-"""
-
 from collections import OrderedDict
-
 import torch
 import torch.nn as nn
-
 from visual_analogy.models.moe_lora import TokenWiseGatedMoELoraLinear
 from visual_analogy.models.selective_lora import BaseLoRALinear
 from visual_analogy.utils.selective_lora import _get_parent
-
-
-# ---------------------------------------------------------------------------
-# Injection
-# ---------------------------------------------------------------------------
 
 def inject_moe_lora_modules(
     model: nn.Module,
@@ -38,10 +15,8 @@ def inject_moe_lora_modules(
     top_k: int = 1,
 ) -> list[str]:
     """Replace target nn.Linear (or BaseLoRALinear) modules with MoE LoRA.
-
     Replacement is done deepest-first to avoid replacing a parent before
     its children have been scanned.
-
     Args:
         model:                        the transformer to modify in-place
         target_linear_name_suffixes:  list of module name suffixes to match
@@ -50,11 +25,10 @@ def inject_moe_lora_modules(
         lora_alpha:                   LoRA alpha (scaling = lora_alpha / r)
         lora_dropout:                 dropout applied to x before each expert
         top_k:                        experts selected per token
-
     Returns:
         List of replaced module names.
     """
-    candidates: list[tuple[str, nn.Module]] = []
+    candidates = []
     for name, module in model.named_modules():
         if not any(name.endswith(sfx) for sfx in target_linear_name_suffixes):
             continue
@@ -67,7 +41,7 @@ def inject_moe_lora_modules(
     # Sort deepest first to prevent double-replacement
     candidates.sort(key=lambda x: x[0].count("."), reverse=True)
 
-    replaced: list[str] = []
+    replaced = []
     for name, linear in candidates:
         parent, attr = _get_parent(model, name)
         moe_module = TokenWiseGatedMoELoraLinear(
@@ -83,11 +57,6 @@ def inject_moe_lora_modules(
         replaced.append(name)
 
     return replaced
-
-
-# ---------------------------------------------------------------------------
-# Save / Load
-# ---------------------------------------------------------------------------
 
 def save_moe_lora_state_dict(model: nn.Module, output_file_path: str) -> OrderedDict:
     """Save gate weights and all expert lora_A / lora_B weights.
@@ -112,13 +81,14 @@ def save_moe_lora_state_dict(model: nn.Module, output_file_path: str) -> Ordered
     torch.save(ckpt, output_file_path)
     return ckpt
 
-
 def load_moe_lora_state_dict(
     model: nn.Module,
     ckpt_path: str,
     device: str = "cpu",
 ) -> None:
-    """Restore MoE LoRA weights saved by :func:`save_moe_lora_state_dict`."""
+    """Restore MoE LoRA weights saved by:
+        func:`save_moe_lora_state_dict`.
+    """
     raw_sd: dict = torch.load(ckpt_path, map_location=device, weights_only=True)
 
     moe_map: dict[str, TokenWiseGatedMoELoraLinear] = {
@@ -172,11 +142,6 @@ def load_moe_lora_state_dict(
 
     print(f"[MoE LoRA Load] loaded={loaded}, skipped={skipped} from {ckpt_path}")
 
-
-# ---------------------------------------------------------------------------
-# Parameter collection
-# ---------------------------------------------------------------------------
-
 def collect_moe_lora_params(model: nn.Module) -> list[torch.nn.Parameter]:
     """Return a deduplicated list of all trainable MoE LoRA parameters.
 
@@ -201,8 +166,7 @@ def collect_moe_lora_params(model: nn.Module) -> list[torch.nn.Parameter]:
                     seen.add(id(p))
     return params
 
-
-def collect_moe_aux_losses(model: nn.Module) -> torch.Tensor | None:
+def collect_moe_aux_losses(model: nn.Module):   
     """Average the Switch-Transformer load-balancing losses across MoE modules.
 
     Returns None when no MoE modules are present or when all aux losses are
@@ -217,7 +181,6 @@ def collect_moe_aux_losses(model: nn.Module) -> torch.Tensor | None:
     if not losses:
         return None
     return torch.stack(losses).mean()
-
 
 def set_moe_lora_requires_grad(model: nn.Module, requires_grad: bool) -> None:
     """Toggle requires_grad on every MoE LoRA parameter."""

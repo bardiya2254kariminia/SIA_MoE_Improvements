@@ -17,30 +17,8 @@ num_val_inference_steps: 28
 
 lora_rank: 16
 lora_dropout: 0.0
-lora_name: "visual-analogy-lora"
+lora_name: "visual-analogy-gstlora"
 
-# ---------------------------------------------------------------------------
-# MoE LoRA configuration (only used when --use_MoE is passed or use_MoE: true)
-# ---------------------------------------------------------------------------
-use_MoE: false
-
-# Layers that get TokenWiseGatedMoELoraLinear (image-stream MLP output,
-# analogous to VIRAL's img_mlp.net.2). These are excluded from BaseLoRALinear.
-moe_target_modules:
-  - "ff.net.2"
-
-# MoE-specific LoRA rank and alpha (can differ from the base lora_rank)
-moe_lora_rank: 16
-moe_lora_alpha: 16.0
-
-# Number of experts and top-k routing per token
-num_experts: 4
-moe_top_k: 1
-
-# Weight for the Switch-Transformer load-balancing auxiliary loss
-moe_aux_loss_weight: 0.005
-
-# ========================================================================
 resume_from_checkpoint: false
 max_train_steps: 50000
 
