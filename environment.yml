@@ -1,0 +1,29 @@
+name: visual_analogy
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - accelerate==1.8.1
+      - datasets==4.1.1
+      - diffusers==0.35.0
+      - gdown==5.2.0
+      - matplotlib==3.10.7
+      - numpy==2.2.6
+      - omegaconf==2.3.0
+      - peft==0.17.0
+      - pydantic==2.11.7
+      - safetensors==0.5.3
+      - sentencepiece==0.2.0
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - tqdm==4.67.1
+      - transformers==4.53.0
+      - wandb==0.21.1
+      - opencv-python==4.12.0.88
+      - lpips==0.1.4
+      - insightface==0.7.3
+      - onnxruntime==1.23.0

@@ -1,0 +1,105 @@
+tracker_name: visual-analogy
+wandb_run_name: "stlora_flux2_klein_analogy"
+
+output_dir: "/workspace/visual_analogy/experiments/stlora_flux2_klein_analogy"
+
+# Pre-trained simple LoRA checkpoint to merge (frozen) before injecting STLoRA
+base_lora_path: "/workspace/visual_analogy/experiments/stlora_flux2_klein_analogy/checkpoint-10500"
+
+pretrained_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+
+data_root: "/workspace/visual_analogy/data"
+
+# Training (and inference) image resolution — must be a multiple of 16.
+# Keep in sync with infer_single.py --cell_size.
+resolution: 512
+
+seed: 0
+checkpointing_steps: 300
+validation_steps: 40
+
+# validation_lora_scales: [-1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5]
+validation_lora_scales: [-1, -0.5, 0, 0.5, 1]
+num_val_inference_steps: 28
+
+lora_rank: 16
+lora_dropout: 0.0
+lora_name: "visual-analogy-lora"
+
+# ---------------------------------------------------------------------------
+# MoE LoRA configuration (only used when --use_MoE is passed or use_MoE: true)
+# ---------------------------------------------------------------------------
+use_MoE: false
+
+# Layers that get TokenWiseGatedMoELoraLinear (image-stream MLP output,
+# analogous to VIRAL's img_mlp.net.2). These are excluded from BaseLoRALinear.
+moe_target_modules:
+  - "ff.net.2"
+
+# MoE-specific LoRA rank and alpha (can differ from the base lora_rank)
+moe_lora_rank: 16
+moe_lora_alpha: 16.0
+
+# Number of experts and top-k routing per token
+num_experts: 4
+moe_top_k: 1
+
+# Learning rate for MoE gate + experts (defaults to learning_rate if omitted)
+# moe_lora_learning_rate: 5e-5
+
+# Weight for the Switch-Transformer load-balancing auxiliary loss
+moe_aux_loss_weight: 0.005
+
+
+# ========================================================================
+
+resume_from_checkpoint: true
+max_train_steps: 50000
+
+lr_warmup_steps: 0
+learning_rate: 5e-5
+base_lora_learning_rate: 5e-5
+base_lora_step_ratio: 0.333
+base_lora_anchor_weight: 0.1
+train_batch_size: 24
+gradient_accumulation_steps: 1
+# guidance_scale is unused for Klein (Klein does not support CFG guidance)
+max_grad_norm: 1
+# Timestep sampling range — keep aligned with scheduler's 1000 steps
+max_train_timesteps: 1000
+min_train_timesteps: 0
+
+# Ablation: "concat" (default, separate images T=10/20/30) or "grid" (2x2 spatial grid)
+analogy_mode: "concat"
+
+# --- Inference-only: time-varying schedule for the text-embedding steering alpha
+# Each entry is [step_boundary, alpha]; for denoising step index t the first
+# entry with t < step_boundary wins (piecewise-constant, left-closed).
+# When set, this overrides --embedding_scales in infer_single.py and runs one
+# inference per (suppress-mode × stlora-scale). Remove or comment out to fall
+# back to the constant-alpha sweep.
+# embedding_schedule:
+#   - [10, -40.0]   # steps  0- 9 -> alpha = -40
+#   - [20, -30.0]   # steps 10-19 -> alpha = -30
+#   - [28, -20.0]   # steps 20-27 -> alpha = -20
+
+# --- Inference-only: where to add the text-embedding steering vector.
+#   "tokens" : only at the suppressed edit's own token positions (same
+#              footprint as STLoRA — default, minimal intervention).
+#   "prompt" : at every non-padding prompt token (pushes against residue
+#              that leaked into surrounding tokens through the encoder's
+#              self-attention).
+# Pass a list to sweep both as an ablation — each scope gets its own output
+# subdirectory (out/scope_tokens/, out/scope_prompt/).
+# embedding_steering_scope: "tokens"
+# embedding_steering_scope: ["tokens", "prompt"]
+
+# --- Inference-only: how the steering vector modifies the prompt embedding.
+#   "add"    : x' = x + alpha * v_hat           (pure additive push; default)
+#   "ablate" : x' = x - (x . v_hat) v_hat
+#                    + alpha * v_hat             (directional ablation + push)
+# 'ablate' first projects the concept component OUT of x (deleting it from
+# that 1-D subspace regardless of its magnitude), then adds a controlled
+# anti-push. Usually dramatically stronger than 'add' at the same |alpha| —
+# when switching, reduce embedding_scale_factor and the schedule alphas.
+# embedding_steering_mode: "ablate"
