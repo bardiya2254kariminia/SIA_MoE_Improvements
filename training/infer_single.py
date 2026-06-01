@@ -51,6 +51,7 @@ from diffusers.models import AutoencoderKLFlux2, Flux2Transformer2DModel
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from visual_analogy.models.selective_lora import SelectiveLoRALinear, BaseLoRALinear
+from visual_analogy.models.moe_lora import TokenWiseGatedMoELoraLinear
 from visual_analogy.utils import (
     resolve_hf_snapshot_path,
     load_base_lora_state_dict,
@@ -63,9 +64,14 @@ from visual_analogy.utils.selective_lora import (
     klein_templated_prompt_token_positions,
     load_base_lora_from_peft_checkpoint,
 )
+from visual_analogy.utils.moe_lora import (
+    inject_moe_lora_modules,
+    load_moe_lora_state_dict,
+)
 from training.train_stlora_flux2_klein import (
     BASE_LORA_TARGET_MODULES,
     STLORA_TARGET_MODULES,
+    MOE_LORA_TARGET_MODULES_DEFAULT,
     build_analogy_prompt,
     build_token_mask,
     compute_empirical_mu,
@@ -144,22 +150,73 @@ def load_pipeline(args, device):
     transformer  = Flux2Transformer2DModel.from_pretrained(local_path, subfolder="transformer", local_files_only=True)
     scheduler    = FlowMatchEulerDiscreteScheduler.from_pretrained(local_path, subfolder="scheduler", local_files_only=True)
 
-    n_base = inject_base_lora_modules(transformer, BASE_LORA_TARGET_MODULES,
-                                      r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
-    print(f"[Base LoRA] Injected {len(n_base)} modules")
-    load_base_lora_from_peft_checkpoint(transformer, args.base_lora_path, device="cpu")
+    # ---- Determine MoE settings from config ----
+    use_moe = bool(getattr(args, "use_MoE", False))
+    moe_target_modules = list(getattr(args, "moe_target_modules",
+                                      MOE_LORA_TARGET_MODULES_DEFAULT))
 
+    # ---- Inject BaseLoRALinear on non-MoE modules ----
+    if use_moe:
+        base_only_modules = [
+            m for m in BASE_LORA_TARGET_MODULES
+            if not any(m.endswith(sfx) for sfx in moe_target_modules)
+        ]
+    else:
+        base_only_modules = BASE_LORA_TARGET_MODULES
+
+    n_base = inject_base_lora_modules(transformer, base_only_modules,
+                                      r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
+    print(f"[Base LoRA] Injected {len(n_base)} BaseLoRALinear modules")
+
+    # ---- Inject MoE LoRA on MoE target modules (if enabled) ----
+    if use_moe:
+        moe_lora_rank  = int(getattr(args, "moe_lora_rank",  args.lora_rank))
+        moe_lora_alpha = float(getattr(args, "moe_lora_alpha", moe_lora_rank))
+        num_experts    = int(getattr(args, "num_experts", 4))
+        moe_top_k      = int(getattr(args, "moe_top_k", 1))
+        n_moe = inject_moe_lora_modules(
+            transformer, moe_target_modules,
+            num_experts=num_experts, r=moe_lora_rank,
+            lora_alpha=moe_lora_alpha, top_k=moe_top_k,
+        )
+        print(f"[MoE LoRA] Injected {len(n_moe)} TokenWiseGatedMoELoraLinear modules: "
+              f"{list(n_moe)}")
+
+    # ---- Load base LoRA weights: auto-detect custom (.pt) vs PEFT safetensors ----
+    _custom_ckpt  = os.path.join(args.base_lora_path, "base_lora.pt")
+    _peft_sf_ckpt = os.path.join(args.base_lora_path, "pytorch_lora_weights.safetensors")
+    _peft_bin_ckpt= os.path.join(args.base_lora_path, "pytorch_lora_weights.bin")
+
+    if os.path.exists(_custom_ckpt):
+        print(f"[Base LoRA] Loading custom format from {_custom_ckpt}")
+        load_base_lora_state_dict(transformer, _custom_ckpt, device="cpu")
+    elif os.path.exists(_peft_sf_ckpt) or os.path.exists(_peft_bin_ckpt):
+        print(f"[Base LoRA] Loading PEFT format from {args.base_lora_path}")
+        load_base_lora_from_peft_checkpoint(transformer, args.base_lora_path, device="cpu")
+    else:
+        raise FileNotFoundError(
+            f"[Base LoRA] No checkpoint found in '{args.base_lora_path}'.\n"
+            f"  Expected 'base_lora.pt' (custom) or "
+            f"'pytorch_lora_weights.safetensors' (PEFT)."
+        )
+
+    # ---- Load MoE weights from the base_lora_path (if use_MoE) ----
+    if use_moe:
+        _moe_ckpt = os.path.join(args.base_lora_path, "moe_lora.pt")
+        if os.path.exists(_moe_ckpt):
+            load_moe_lora_state_dict(transformer, _moe_ckpt, device="cpu")
+            print(f"[MoE LoRA] Loaded from {_moe_ckpt}")
+        else:
+            print("[MoE LoRA] No moe_lora.pt in base_lora_path — MoE weights are random")
+
+    # ---- Inject STLoRA on context modules ----
     n_st = inject_selective_lora_modules(transformer, STLORA_TARGET_MODULES,
                                          r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
-    print(f"[STLoRA] Injected {len(n_st)} modules")
+    print(f"[STLoRA] Injected {len(n_st)} SelectiveLoRALinear modules")
 
+    # ---- Load Stage-2 checkpoint (STLoRA + updated base/MoE weights) ----
     explicit_ckpt = getattr(args, "checkpoint_dir", None)
     if explicit_ckpt:
-        # Fail loud: a user-supplied path that doesn't exist used to be
-        # silently swallowed (ckpt_dir = None), which left STLoRA at its
-        # zero-initialised state — STLoRA had *no effect* and st=0 vs st=1
-        # produced visually identical outputs. Now we raise so typos /
-        # wrong experiment names are caught immediately.
         if not os.path.isdir(explicit_ckpt):
             raise FileNotFoundError(
                 f"--checkpoint_dir not found: {explicit_ckpt}\n"
@@ -194,19 +251,24 @@ def load_pipeline(args, device):
             else:
                 print("[Checkpoint] WARNING — all STLoRA lora_B weights are zero")
         elif explicit_ckpt:
-            # User explicitly pointed at a checkpoint dir but it has no
-            # selective_lora.pt — that almost certainly means the user
-            # picked a base-LoRA-only run by mistake. Refuse to silently
-            # run with zero-init STLoRA.
             raise FileNotFoundError(
                 f"selective_lora.pt missing from {ckpt_dir}\n"
                 f"  Files present: {sorted(os.listdir(ckpt_dir))}\n"
                 f"  Without this file STLoRA is zero-initialised and has "
                 f"no effect (st=0 == st=1).")
+
+        # Load updated base LoRA weights from checkpoint (if refined in Stage 2)
         bl_path = os.path.join(ckpt_dir, "base_lora.pt")
         if os.path.exists(bl_path):
             load_base_lora_state_dict(transformer, bl_path, device)
             print("[Checkpoint] Base LoRA loaded from checkpoint")
+
+        # Load updated MoE weights from checkpoint (if refined in Stage 2)
+        if use_moe:
+            moe_ckpt_path = os.path.join(ckpt_dir, "moe_lora.pt")
+            if os.path.exists(moe_ckpt_path):
+                load_moe_lora_state_dict(transformer, moe_ckpt_path, device)
+                print("[Checkpoint] MoE LoRA loaded from checkpoint")
     else:
         print("[Checkpoint] No checkpoint found — using freshly initialised weights")
 
@@ -228,12 +290,23 @@ SCALE_VALUES = [0.0, 0.25, 0.5, 0.75, 1.0]  # overridden by --scale_values
 
 @contextmanager
 def lora_mode_ctx(transformer, base_lora_scale: float = 1.0, stlora_scale: float = 1.0):
-    """Scale both LoRAs by the given multipliers (0.0 = off, 1.0 = full strength)."""
+    """Scale LoRA modules by the given multipliers (0.0 = off, 1.0 = full strength).
+
+    - BaseLoRALinear  and TokenWiseGatedMoELoraLinear both scale with base_lora_scale
+      (they are trained together in Stage 1 as the base representation).
+    - SelectiveLoRALinear scales with stlora_scale (trained in Stage 2).
+    """
     base_mods = [m for m in transformer.modules() if type(m) is BaseLoRALinear]
+    moe_mods  = [m for m in transformer.modules() if isinstance(m, TokenWiseGatedMoELoraLinear)]
     st_mods   = [m for m in transformer.modules() if isinstance(m, SelectiveLoRALinear)]
+
     orig_base = [m.scaling for m in base_mods]
+    orig_moe  = [m.scaling for m in moe_mods]
+
     for m, s in zip(base_mods, orig_base):
         m.scaling = base_lora_scale * s
+    for m, s in zip(moe_mods, orig_moe):
+        m.set_scaling(base_lora_scale * s)
     for m in st_mods:
         m.set_scaling(stlora_scale * m.alpha / m.r)
     try:
@@ -241,6 +314,8 @@ def lora_mode_ctx(transformer, base_lora_scale: float = 1.0, stlora_scale: float
     finally:
         for m, s in zip(base_mods, orig_base):
             m.scaling = s
+        for m, s in zip(moe_mods, orig_moe):
+            m.set_scaling(s)
         for m in st_mods:
             m.reset_scaling()
 

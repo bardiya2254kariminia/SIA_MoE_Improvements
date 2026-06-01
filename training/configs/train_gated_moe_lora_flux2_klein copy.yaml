@@ -31,22 +31,22 @@ moe_target_modules:
   -  "attn.to_q"
   -  "attn.to_v"
   -  "attn.to_out.0"
-  -  "attn.add_k_proj"
-  -  "attn.add_q_proj"
-  -  "attn.add_v_proj"
+  # -  "attn.add_k_proj"
+  # -  "attn.add_q_proj"
+  # -  "attn.add_v_proj"
   -  "attn.to_add_out"
   -  "ff.net.0.proj"
   -  "ff.net.2"
-  -  "ff_context.net.0.proj"
-  -  "ff_context.net.2"
+  # -  "ff_context.net.0.proj"
+  # -  "ff_context.net.2"
 
 # MoE-specific LoRA rank and alpha (can differ from the base lora_rank)
 moe_lora_rank: 16
-moe_lora_alpha: 16.0
+moe_lora_alpha: 8.0
 
 # Number of experts and top-k routing per token
-num_experts: 6
-moe_top_k: 3
+num_experts: 3
+moe_top_k: 1
 
 # Weight for the Switch-Transformer load-balancing auxiliary loss
 moe_aux_loss_weight: 0.005
