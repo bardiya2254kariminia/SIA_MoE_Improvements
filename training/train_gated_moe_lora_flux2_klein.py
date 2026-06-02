@@ -225,6 +225,13 @@ class ImageAnalogyDataset(Dataset):
                 f"Edit 1: {pair_a['edit1']}. Edit 2: {pair_a['edit2']}. "
                 "Apply the same edits to image 3 to produce the output."
             )
+
+        # 10 % null-conditioning drop for classifier-free guidance training.
+        # An empty string causes the text encoder to produce an unconditional
+        # embedding, teaching the model to also generate without text guidance.
+        if random.random() < 0.1:
+            combined_prompt = ""
+
         a = Image.open(a_path).convert('RGB')
         a_prime = Image.open(a_prime_path).convert('RGB')
         b = Image.open(b_path).convert('RGB')

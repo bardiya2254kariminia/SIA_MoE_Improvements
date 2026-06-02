@@ -4,7 +4,7 @@ import re
 import torch
 import torch.nn as nn
 from visual_analogy.models.selective_lora import SelectiveLoRALinear, BaseLoRALinear
-
+from visual_analogy.models.moe_lora import TokenWiseGatedMoELoraLinear
 
 def _apply_klein_chat_template(prompt: str, tokenizer) -> str:
     """Wrap ``prompt`` in the same Qwen chat template that
@@ -146,7 +146,7 @@ def inject_selective_lora_modules(model, target_linear_name_suffixes, r, alpha, 
         if module.__class__.__name__ == "SelectiveLoRALinear":  # Already loaded (Useful for debugging)
             module = module.base
 
-        is_target = isinstance(module, (nn.Linear, BaseLoRALinear))
+        is_target = isinstance(module, (nn.Linear, BaseLoRALinear, TokenWiseGatedMoELoraLinear))
         if is_target and any(name.endswith(sfx) for sfx in target_linear_name_suffixes):
             parent, attr = _get_parent(model, name)
             wrapped = SelectiveLoRALinear(module, r=r, alpha=alpha, dropout=dropout)
