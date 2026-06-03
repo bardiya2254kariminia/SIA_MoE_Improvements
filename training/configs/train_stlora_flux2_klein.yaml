@@ -8,7 +8,7 @@ base_lora_path: "/workspace/visual_analogy/experiments/stlora_flux2_klein_analog
 
 pretrained_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
 
-data_root: "/workspace/visual_analogy/data"
+data_root: "/workspace/SIA_Dataset_creation/datasets/SIA_datasets/train"
 
 # Training (and inference) image resolution — must be a multiple of 16.
 # Keep in sync with infer_single.py --cell_size.

@@ -219,122 +219,270 @@ MOE_LORA_TARGET_MODULES_DEFAULT = ["ff.net.2"]
 # Dataset — A'=total_changes.png, B'=pose_only.png, loads prompt.json
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# SIA dataset helpers (shared with train_gated_moe_lora_flux2_klein)
+# ---------------------------------------------------------------------------
+
+def _parse_combined_filename(filename: str):
+    """'combined123.png' → sorted list [1, 2, 3].  Returns None if no match."""
+    m = re.match(r'combined(\d+)\.png$', filename)
+    if not m:
+        return None
+    return sorted(int(d) for d in m.group(1))
+
+
+def _get_combined_files(data_dir: Path):
+    """Return list of (filename, edit_indices) for every combined*.png in data_dir."""
+    result = []
+    for f in data_dir.iterdir():
+        indices = _parse_combined_filename(f.name)
+        if indices is not None:
+            result.append((f.name, indices))
+    return result
+
+
+def _tier_probs(n_tiers: int) -> list:
+    """Per-tier probabilities, longest tier first.
+
+    1 → [1.0]
+    2 → [0.70, 0.30]
+    3 → [0.70, 0.20, 0.10]
+    4+ → [0.70, 0.20, 0.10/(n-2), ...]
+    """
+    if n_tiers <= 1:
+        return [1.0] * max(n_tiers, 1)
+    if n_tiers == 2:
+        return [0.70, 0.30]
+    if n_tiers == 3:
+        return [0.70, 0.20, 0.10]
+    tail = 0.10 / (n_tiers - 2)
+    return [0.70, 0.20] + [tail] * (n_tiers - 2)
+
+
+def _sample_combined(combined_files: list):
+    """Sample one (filename, edit_indices) using tier probabilities.
+
+    Tier = len(edit_indices).  Longest tier → highest probability.
+    """
+    if not combined_files:
+        raise ValueError("combined_files is empty")
+    tier_dict: dict = {}
+    for fname, indices in combined_files:
+        t = len(indices)
+        tier_dict.setdefault(t, []).append((fname, indices))
+    sorted_tiers = sorted(tier_dict.keys(), reverse=True)
+    probs = _tier_probs(len(sorted_tiers))
+    chosen_tier = random.choices(sorted_tiers, weights=probs)[0]
+    return random.choice(tier_dict[chosen_tier])
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 class ImageAnalogyDataset(Dataset):
-    """Image analogy dataset for STLoRA training.
+    """Image analogy dataset for STLoRA training using the SIA_datasets/train structure.
 
-    Each stem folder has:
-      - input.png           (before image)
-      - total_changes.png   (after image with both edit1 + edit2)
-      - pose_only.png       (after image with edit1 only)
-      - prompt.json         (with edit1, edit2 fields)
+    Directory layout::
 
-    Sampling: stem1 → A=input, A'=total_changes (shows both edits)
-              stem2 → B=input, B'=pose_only     (edit1 only, edit2 suppressed)
+        <data_root>/
+            <edit_category>/        # 3_edits | 4edits | 2edits_non_creature | 3edits_non_creature
+                <setting>/          # setting1 | setting2 | …
+                    <data_item>/    # data1 | data2 | …
+                        input.png           → A / B  (before)
+                        combined1.png       → partial (edit 1 only)
+                        combined12.png      → partial (edits 1+2)
+                        combined123.png     → total   (all edits) ← 70 % probability
+                        prompt.json         → {"edit1": "…", "edit2": "…", …}
+
+    STLoRA sampling procedure:
+
+    1. Pick an edit category uniformly at random.
+    2. Pick a setting within that category uniformly at random.
+    3. Pick two distinct data items (data_a → A-side, data_b → B-side).
+    4. A_prime_total = longest combined of data_a (all edits applied).
+       B_total       = longest combined of data_b.
+    5. For B_prime (the suppressed target):
+       - Collect all combined files of data_b that have exactly one fewer edit
+         than B_total and whose edit indices are a strict subset of B_total's.
+       - If none exist, fall back to any shorter combined.
+       - Sample B_prime uniformly from this candidate pool.
+    6. suppress_index = the single 0-based index (into pair_a_edits / pair_b_edits)
+       of the edit present in B_total but absent from B_prime.
+       If multiple edits are suppressed, pick one randomly.
+    7. A_prime_partial = combined of data_a with the same edit indices as B_prime
+       (used in the base-LoRA partial branch). Set to None if unavailable.
+    8. Build the full prompt from all edits in A_prime_total.
     """
 
     def __init__(self, data_root):
         self.data_root = Path(data_root)
-        self.styles = []
 
-        for concept_dir in sorted(self.data_root.iterdir()):
-            if not concept_dir.is_dir():
+        # categories[cat][setting] = list of (data_dir, combined_files, prompt_dict)
+        self.categories: dict = {}
+        n_skipped = 0
+
+        for cat_dir in sorted(self.data_root.iterdir()):
+            if not cat_dir.is_dir():
                 continue
-            edit_name = (
-                re.sub(r'^\d+-', '', concept_dir.name)
-                .replace('_', ' ').replace('-', ' ').lower().strip()
-            )
-            for style_dir in sorted(concept_dir.iterdir()):
-                if not style_dir.is_dir():
+            cat = cat_dir.name
+            self.categories[cat] = {}
+
+            for setting_dir in sorted(cat_dir.iterdir()):
+                if not setting_dir.is_dir():
                     continue
-                stems = []
-                for stem_dir in sorted(style_dir.iterdir()):
-                    if not stem_dir.is_dir():
-                        continue
-                    input_path        = stem_dir / 'input.png'
-                    total_changes_path = stem_dir / 'total_changes.png'
-                    pose_only_path    = stem_dir / 'pose_only.png'
-                    style_only_path   = stem_dir / 'style_only.png'
-                    prompt_file       = stem_dir / 'prompt.json'
-                    if not (input_path.exists() and total_changes_path.exists()
-                            and (pose_only_path.exists() or style_only_path.exists())):
-                        continue
-                    edit1, edit2 = "", ""
-                    if prompt_file.exists():
-                        try:
-                            data = json.loads(prompt_file.read_text())
-                            edit1 = data.get("edit1", "")
-                            edit2 = data.get("edit2", "")
-                        except Exception:
-                            pass
-                    stems.append((
-                        str(input_path), str(total_changes_path),
-                        str(style_only_path) if style_only_path.exists() else None,
-                        str(pose_only_path) if pose_only_path.exists() else None,
-                        edit1, edit2,
-                    ))
+                setting = setting_dir.name
+                samples = []
 
-                if len(stems) >= 2:
-                    self.styles.append((edit_name, stems))
+                for data_dir in sorted(setting_dir.iterdir()):
+                    if not data_dir.is_dir():
+                        continue
+                    if not (data_dir / 'input.png').exists():
+                        n_skipped += 1
+                        continue
+                    if not (data_dir / 'prompt.json').exists():
+                        n_skipped += 1
+                        continue
+                    combined = _get_combined_files(data_dir)
+                    if len(combined) < 2:
+                        # Need at least a total and one partial for STLoRA
+                        n_skipped += 1
+                        continue
+                    try:
+                        prompt_dict = json.loads((data_dir / 'prompt.json').read_text())
+                    except Exception:
+                        n_skipped += 1
+                        continue
+                    samples.append((data_dir, combined, prompt_dict))
 
-        print(f"ImageAnalogyDataset: {len(self.styles)} style groups loaded.")
+                if len(samples) >= 2:
+                    self.categories[cat][setting] = samples
+
+        self.cat_names = sorted(self.categories.keys())
+        total = sum(len(s) for c in self.categories.values() for s in c.values())
+        print(f"SIADataset (STLoRA): {len(self.cat_names)} categories, "
+              f"{total} samples ({n_skipped} skipped)")
+        for cat in self.cat_names:
+            n = sum(len(s) for s in self.categories[cat].values())
+            print(f"  {cat}: {len(self.categories[cat])} settings, {n} samples")
 
     def __len__(self):
-        return len(self.styles)
+        return sum(len(s) for c in self.categories.values() for s in c.values())
+
+    @staticmethod
+    def _longest_combined(combined_files: list):
+        """Return (filename, edit_indices) of the combined file with the most edits."""
+        return max(combined_files, key=lambda x: len(x[1]))
+
+    @staticmethod
+    def _partial_candidates(combined_files: list, total_indices: list):
+        """Combined files that are one edit shorter than total and are subsets of it.
+
+        Falls back to any shorter combined if no one-shorter candidates exist.
+        """
+        total_set = set(total_indices)
+        total_len = len(total_indices)
+        one_shorter = [
+            (fn, idx) for fn, idx in combined_files
+            if len(idx) == total_len - 1 and set(idx).issubset(total_set)
+        ]
+        if one_shorter:
+            return one_shorter
+        # Fallback: any combined shorter than total
+        shorter = [(fn, idx) for fn, idx in combined_files if len(idx) < total_len]
+        return shorter if shorter else combined_files  # last-resort: use all
+
+    def sample_val_pair(self):
+        """Return raw paths and metadata for use in validation."""
+        cat = random.choice(self.cat_names)
+        setting = random.choice(list(self.categories[cat].keys()))
+        samples = self.categories[cat][setting]
+        sample_a, sample_b = random.sample(samples, 2)
+        data_dir_a, combined_a, prompt_a = sample_a
+        data_dir_b, combined_b, prompt_b = sample_b
+
+        fname_a_total, total_indices_a = self._longest_combined(combined_a)
+        fname_b_total, total_indices_b = self._longest_combined(combined_b)
+
+        candidates_b = self._partial_candidates(combined_b, total_indices_b)
+        fname_b_prime, b_prime_indices = random.choice(candidates_b)
+
+        suppressed_digits = sorted(set(total_indices_b) - set(b_prime_indices))
+        suppress_index = (suppressed_digits[0] - 1) if suppressed_digits else 0
+
+        map_a = {frozenset(idx): fn for fn, idx in combined_a}
+        fname_a_partial = map_a.get(frozenset(b_prime_indices))
+
+        pair_a_edits = [prompt_a.get(f'edit{i}', '') for i in sorted(total_indices_a)]
+        pair_b_edits = [prompt_b.get(f'edit{i}', '') for i in sorted(total_indices_b)]
+        full_prompt = build_analogy_prompt(pair_a_edits, pair_b_edits)
+
+        return {
+            'a_path':            str(data_dir_a / 'input.png'),
+            'a_prime_path':      str(data_dir_a / fname_a_total),
+            'a_prime_partial_path': str(data_dir_a / fname_a_partial) if fname_a_partial else None,
+            'b_path':            str(data_dir_b / 'input.png'),
+            'b_prime_path':      str(data_dir_b / fname_b_prime),
+            'b_total_path':      str(data_dir_b / fname_b_total),
+            'edit_name':         f"{cat}/{setting}",
+            'prompt':            full_prompt,
+            'pair_a_edits':      pair_a_edits,
+            'pair_b_edits':      pair_b_edits,
+            'suppress_index':    suppress_index,
+        }
 
     def __getitem__(self, idx):
-        edit_name, stems = random.choice(self.styles)
-        stem_a, stem_b = random.sample(stems, 2)
-        # stem = (input, total_changes, style_only_or_None, pose_only_or_None, edit1, edit2)
+        # 1. Category (uniform)
+        cat = random.choice(self.cat_names)
+        settings = self.categories[cat]
 
-        # A pair: input → (total_changes; partial matched to B side when available)
-        a       = Image.open(stem_a[0]).convert('RGB')   # input.png
-        a_total = Image.open(stem_a[1]).convert('RGB')   # total_changes.png
-        a_edit1, a_edit2 = stem_a[4], stem_a[5]
+        # 2. Setting (uniform)
+        setting = random.choice(list(settings.keys()))
+        samples = settings[setting]
 
-        # B pair: input → pose_only or style_only (randomly chosen)
-        # Preserve the original training mapping (unchanged from prior version):
-        #   stem[2]  (style_only)  → suppress_index = 1
-        #   stem[3]  (pose_only)   → suppress_index = 0
-        b       = Image.open(stem_b[0]).convert('RGB')   # input.png
-        b_total = Image.open(stem_b[1]).convert('RGB')   # total_changes.png
-        b_edit1, b_edit2 = stem_b[4], stem_b[5]
+        # 3. Two distinct data items
+        sample_a, sample_b = random.sample(samples, 2)
+        data_dir_a, combined_a, prompt_a = sample_a
+        data_dir_b, combined_b, prompt_b = sample_b
 
-        # Build {suppress_index: partial_path} using the same mapping for A and B.
-        a_partials = {}  # {suppress_idx: path}
-        if stem_a[2] is not None:
-            a_partials[1] = stem_a[2]   # style_only → suppress_index 1
-        if stem_a[3] is not None:
-            a_partials[0] = stem_a[3]   # pose_only  → suppress_index 0
-        b_partials = {}
-        if stem_b[2] is not None:
-            b_partials[1] = stem_b[2]
-        if stem_b[3] is not None:
-            b_partials[0] = stem_b[3]
+        # 4. A_prime_total = longest combined of data_a; B_total = longest of data_b
+        fname_a_total, total_indices_a = self._longest_combined(combined_a)
+        fname_b_total, total_indices_b = self._longest_combined(combined_b)
 
-        # Prefer a suppress_index available on BOTH stems so the base-LoRA
-        # partial branch can use a matched partial A'.  If the intersection is
-        # empty, fall back to any B-side option (A' partial will be None →
-        # training loop falls back to A_total for that branch).
-        common = sorted(set(a_partials) & set(b_partials))
-        if common:
-            suppress_index = random.choice(common)
+        # 5. B_prime: one-edit-shorter combined from data_b (subset of B_total)
+        candidates_b = self._partial_candidates(combined_b, total_indices_b)
+        fname_b_prime, b_prime_indices = random.choice(candidates_b)
+
+        # 6. suppress_index: 0-based index of the suppressed edit digit
+        suppressed_digits = sorted(set(total_indices_b) - set(b_prime_indices))
+        if suppressed_digits:
+            # Pick one suppressed edit (randomly when multiple edits dropped)
+            chosen_digit = random.choice(suppressed_digits)
+            suppress_index = chosen_digit - 1  # convert 1-based digit to 0-based
         else:
-            suppress_index = random.choice(list(b_partials))
+            suppress_index = 0  # fallback
 
-        b_prime_path = b_partials[suppress_index]
-        b_prime = Image.open(b_prime_path).convert('RGB')
+        # 7. A_prime_partial: same edit indices as B_prime but from data_a
+        map_a = {frozenset(idx): fn for fn, idx in combined_a}
+        fname_a_partial = map_a.get(frozenset(b_prime_indices))
 
-        a_partial_path = a_partials.get(suppress_index)
-        a_partial = (Image.open(a_partial_path).convert('RGB')
-                     if a_partial_path is not None else None)
+        # 8. Build edit lists and full prompt
+        pair_a_edits = [prompt_a.get(f'edit{i}', '') for i in sorted(total_indices_a)]
+        pair_b_edits = [prompt_b.get(f'edit{i}', '') for i in sorted(total_indices_b)]
+        full_prompt = build_analogy_prompt(pair_a_edits, pair_b_edits)
 
-        pair_a_edits = [e for e in [a_edit1, a_edit2] if e]
-        pair_b_edits = [e for e in [b_edit1, b_edit2] if e]
+        # Load images
+        a       = Image.open(data_dir_a / 'input.png').convert('RGB')
+        a_total = Image.open(data_dir_a / fname_a_total).convert('RGB')
+        b       = Image.open(data_dir_b / 'input.png').convert('RGB')
+        b_prime = Image.open(data_dir_b / fname_b_prime).convert('RGB')
+        b_total = Image.open(data_dir_b / fname_b_total).convert('RGB')
+        a_partial = (
+            Image.open(data_dir_a / fname_a_partial).convert('RGB')
+            if fname_a_partial else None
+        )
 
-        combined_prompt = build_analogy_prompt(pair_a_edits, pair_b_edits)
-
-        # Harmonize to A's canonical (max_side=512) size; a_partial uses the
-        # same target so it is a drop-in replacement for a_total.
+        # Harmonize sizes
         a, a_total, b, b_prime = harmonize_images(a, a_total, b, b_prime, max_side=512)
         b_total = resize_to_match(b_total, *b.size)
         if a_partial is not None:
@@ -342,14 +490,14 @@ class ImageAnalogyDataset(Dataset):
 
         return {
             'A':                a,
-            'A_prime':          a_total,   # default A' (total_changes), kept for back-compat
+            'A_prime':          a_total,
             'A_prime_total':    a_total,
-            'A_prime_partial':  a_partial, # matched partial or None
+            'A_prime_partial':  a_partial,   # None if no matching partial exists in data_a
             'B':                b,
             'B_prime':          b_prime,
             'B_total':          b_total,
-            'edit_name':        edit_name,
-            'prompt':           combined_prompt,
+            'edit_name':        f"{cat}/{setting}",
+            'prompt':           full_prompt,
             'pair_a_edits':     pair_a_edits,
             'pair_b_edits':     pair_b_edits,
             'suppress_index':   suppress_index,
@@ -723,34 +871,24 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
     device = accelerator.device
     dtype  = torch.bfloat16
 
-    # Pick a random sample
-    edit_name, stems = random.choice(train_dataset.styles)
-    stem_a, stem_b = random.sample(stems, 2)
-    # stem = (input, total_changes, pose_only_or_None, style_only_or_None, edit1, edit2)
-    pair_a_edits = [e for e in [stem_a[4], stem_a[5]] if e]
-    pair_b_edits = [e for e in [stem_b[4], stem_b[5]] if e]
+    # Pick a random sample via dataset helper
+    vp = train_dataset.sample_val_pair()
+    pair_a_edits      = vp['pair_a_edits']
+    pair_b_edits      = vp['pair_b_edits']
+    val_suppress_index = vp['suppress_index']
+    val_b_prime_type  = f"partial (suppress edit {val_suppress_index + 1})"
 
-    # Randomly choose B' type:
-    # stem_b[2] = style_only.png (edit2/style applied, edit1/pose suppressed → suppress index 1)
-    # stem_b[3] = pose_only.png  (edit1/pose applied, edit2/style suppressed → suppress index 0)
-    val_b_prime_options = []
-    if stem_b[2] is not None:
-        val_b_prime_options.append((stem_b[2], 1, 'style_only'))
-    if stem_b[3] is not None:
-        val_b_prime_options.append((stem_b[3], 0, 'pose_only'))
-    val_b_prime_path, val_suppress_index, val_b_prime_type = random.choice(val_b_prime_options)
-
-    prompt = build_analogy_prompt(pair_a_edits, pair_b_edits)
+    prompt            = vp['prompt']
     suppressed_prompt = build_analogy_prompt(pair_a_edits, pair_b_edits,
                                              suppress_indices=[val_suppress_index])
 
     val_sample = {
-        'A':       Image.open(stem_a[0]).convert('RGB'),   # input
-        'A_prime': Image.open(stem_a[1]).convert('RGB'),   # total_changes
-        'B':       Image.open(stem_b[0]).convert('RGB'),   # input
-        'B_prime': Image.open(val_b_prime_path).convert('RGB'),
-        'B_total': Image.open(stem_b[1]).convert('RGB'),   # B with both edits — GT for base-LoRA-total
-        'edit_name': edit_name,
+        'A':       Image.open(vp['a_path']).convert('RGB'),
+        'A_prime': Image.open(vp['a_prime_path']).convert('RGB'),
+        'B':       Image.open(vp['b_path']).convert('RGB'),
+        'B_prime': Image.open(vp['b_prime_path']).convert('RGB'),
+        'B_total': Image.open(vp['b_total_path']).convert('RGB'),
+        'edit_name': vp['edit_name'],
         'prompt':    prompt,
     }
 

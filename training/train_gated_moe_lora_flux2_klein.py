@@ -151,99 +151,236 @@ def harmonize_images(a, a_prime, b, b_prime):
     return a, a_prime, b, b_prime
 
 
-class ImageAnalogyDataset(Dataset):
-    """Dataset for image analogy training.
+# ---------------------------------------------------------------------------
+# SIA dataset helpers
+# ---------------------------------------------------------------------------
 
-    Each stem folder contains exactly one before→after pair: a.png (before)
-    and a_prime.png (after). To form an analogy (A:A'::B:B'), we pick 2 different
-    stems from the same style subdir: first stem → A/A', second stem → B/B'.
+def _parse_combined_filename(filename: str):
+    """'combined123.png' → sorted list [1, 2, 3].  Returns None if no match."""
+    m = re.match(r'combined(\d+)\.png$', filename)
+    if not m:
+        return None
+    return sorted(int(d) for d in m.group(1))
+
+
+def _get_combined_files(data_dir: Path):
+    """Return list of (filename, edit_indices) for every combined*.png in data_dir."""
+    result = []
+    for f in data_dir.iterdir():
+        indices = _parse_combined_filename(f.name)
+        if indices is not None:
+            result.append((f.name, indices))
+    return result
+
+
+def _build_prompt_from_indices(edit_indices: list, prompt_dict: dict) -> str:
+    """Build the analogy prompt from selected 1-based edit indices.
+
+    e.g. edit_indices=[1,2], prompt_dict={"edit1":"add hat","edit2":"add glasses"}
+    →  "Image 1 is the original … Edit 1: add hat. Edit 2: add glasses. Apply …"
+    """
+    edits_part = " ".join(
+        f"Edit {i}: {prompt_dict[f'edit{i}']}."
+        for i in sorted(edit_indices)
+        if prompt_dict.get(f'edit{i}', '')
+    )
+    return (
+        "Image 1 is the original and image 2 is the edited version. "
+        f"{edits_part} "
+        "Apply the same edits to image 3 to produce the output."
+    )
+
+
+def _tier_probs(n_tiers: int) -> list:
+    """Per-tier sampling probabilities, longest tier first.
+
+    1 → [1.0]
+    2 → [0.70, 0.30]
+    3 → [0.70, 0.20, 0.10]
+    4+ → [0.70, 0.20, 0.10/(n-2), ...]
+    """
+    if n_tiers <= 1:
+        return [1.0] * max(n_tiers, 1)
+    if n_tiers == 2:
+        return [0.70, 0.30]
+    if n_tiers == 3:
+        return [0.70, 0.20, 0.10]
+    tail = 0.10 / (n_tiers - 2)
+    return [0.70, 0.20] + [tail] * (n_tiers - 2)
+
+
+def _sample_combined(combined_files: list):
+    """Sample one (filename, edit_indices) using tier probabilities.
+
+    Tier = number of edits applied (len of edit_indices).
+    Longest tier → highest probability.  Uniform within each tier.
+    """
+    if not combined_files:
+        raise ValueError("combined_files is empty")
+    tier_dict: dict = {}
+    for fname, indices in combined_files:
+        t = len(indices)
+        tier_dict.setdefault(t, []).append((fname, indices))
+    sorted_tiers = sorted(tier_dict.keys(), reverse=True)
+    probs = _tier_probs(len(sorted_tiers))
+    chosen_tier = random.choices(sorted_tiers, weights=probs)[0]
+    return random.choice(tier_dict[chosen_tier])
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class ImageAnalogyDataset(Dataset):
+    """Image analogy dataset reading from the SIA_datasets/train structure.
+
+    Directory layout::
+
+        <data_root>/
+            <edit_category>/        # 3_edits | 4edits | 2edits_non_creature | 3edits_non_creature
+                <setting>/          # setting1 | setting2 | …
+                    <data_item>/    # data1 | data2 | …
+                        input.png           → A  (before)
+                        combined1.png       → A' option (edit 1 only)
+                        combined12.png      → A' option (edits 1+2)
+                        combined123.png     → A' option (edits 1+2+3)  ← longest = 70 %
+                        prompt.json         → {"edit1": "…", "edit2": "…", …}
+
+    Sampling procedure for one training pair (A/A', B/B'):
+
+    1. Pick an edit category uniformly at random.
+    2. Pick a setting within that category uniformly at random.
+    3. Pick two distinct data items from that setting.
+    4. Intersect the available combined edit-index sets across both items.
+    5. Sample one edit-index set using tier probabilities
+       (longest = 70 %, second = 20 %, remaining share 10 %).
+    6. Load A/A' from item 1 and B/B' from item 2 using that set.
+    7. Build the prompt from the selected edit indices.
     """
 
     def __init__(self, data_root, mode="concat"):
-        self.mode = mode
         self.data_root = Path(data_root)
-        self.styles = []  # list of (edit_name, stems_list)
+        self.mode = mode  # kept for interface compatibility; concat logic always used
 
-        for concept_dir in sorted(self.data_root.iterdir()):
-            if not concept_dir.is_dir():
+        # categories[cat][setting] = list of (data_dir, combined_files, prompt_dict)
+        self.categories: dict = {}
+        n_skipped = 0
+
+        for cat_dir in sorted(self.data_root.iterdir()):
+            if not cat_dir.is_dir():
                 continue
-            edit_name = re.sub(
-                r'^\d+-', '', concept_dir.name).replace('_', ' ').replace('-', ' ').lower().strip()
+            cat = cat_dir.name
+            self.categories[cat] = {}
 
-            for style_dir in sorted(concept_dir.iterdir()):
-                if not style_dir.is_dir():
+            for setting_dir in sorted(cat_dir.iterdir()):
+                if not setting_dir.is_dir():
                     continue
-                stems = []
-                for stem_dir in sorted(style_dir.iterdir()):
-                    if not stem_dir.is_dir():
+                setting = setting_dir.name
+                samples = []
+
+                for data_dir in sorted(setting_dir.iterdir()):
+                    if not data_dir.is_dir():
                         continue
-                    a = stem_dir / 'input.png'
-                    a_prime = stem_dir / 'total_changes.png'
-                    prompt_file = stem_dir / 'prompt.json'
-                    if a.exists() and a_prime.exists():
-                        edit1, edit2 = "edit the image", "edit the image"
+                    if not (data_dir / 'input.png').exists():
+                        n_skipped += 1
+                        continue
+                    if not (data_dir / 'prompt.json').exists():
+                        n_skipped += 1
+                        continue
+                    combined = _get_combined_files(data_dir)
+                    if not combined:
+                        n_skipped += 1
+                        continue
+                    try:
+                        prompt_dict = json.loads((data_dir / 'prompt.json').read_text())
+                    except Exception:
+                        n_skipped += 1
+                        continue
+                    samples.append((data_dir, combined, prompt_dict))
 
-                        # TODO make sure to add prompt.json later
-                        # TODO code baraye inke Qwen tooye har folder prompt.json besaze
-                        prompt_file = stem_dir / 'prompt.json'
-                        if torch.rand(1).item() < 0.8 and prompt_file.exists():
-                            try:
-                                prompt_data = json.loads(
-                                    prompt_file.read_text())
-                                edit1 = prompt_data.get("edit1", "")
-                                edit2 = prompt_data.get("edit2", "")
-                            except Exception:
-                                pass
-                        stems.append((str(a), str(a_prime), edit1, edit2))
+                if len(samples) >= 2:
+                    self.categories[cat][setting] = samples
 
-                if len(stems) >= 2:
-                    self.styles.append((edit_name, stems))
-
-        print(f"ImageAnalogyDataset: {len(self.styles)} style groups")
+        self.cat_names = sorted(self.categories.keys())
+        total = sum(len(s) for c in self.categories.values() for s in c.values())
+        print(f"SIADataset: {len(self.cat_names)} categories, {total} samples "
+              f"({n_skipped} skipped)")
+        for cat in self.cat_names:
+            n = sum(len(s) for s in self.categories[cat].values())
+            print(f"  {cat}: {len(self.categories[cat])} settings, {n} samples")
 
     def __len__(self):
-        return len(self.styles)
+        return sum(len(s) for c in self.categories.values() for s in c.values())
+
+    def sample_val_pair(self):
+        """Return a dict with raw paths and prompt for use in validation."""
+        cat = random.choice(self.cat_names)
+        setting = random.choice(list(self.categories[cat].keys()))
+        samples = self.categories[cat][setting]
+        sample_a, sample_b = random.sample(samples, 2)
+        data_dir_a, combined_a, prompt_a = sample_a
+        data_dir_b, combined_b, prompt_b = sample_b
+
+        map_a = {frozenset(idx): fn for fn, idx in combined_a}
+        map_b = {frozenset(idx): fn for fn, idx in combined_b}
+        common = set(map_a) & set(map_b)
+        pool = [(map_a[k], sorted(k)) for k in common] if common else combined_a
+        fname_a, indices = _sample_combined(pool)
+        fname_b = map_b.get(frozenset(indices), _sample_combined(combined_b)[0])
+
+        prompt = _build_prompt_from_indices(indices, prompt_a)
+        return {
+            'a_path':       str(data_dir_a / 'input.png'),
+            'a_prime_path': str(data_dir_a / fname_a),
+            'b_path':       str(data_dir_b / 'input.png'),
+            'b_prime_path': str(data_dir_b / fname_b),
+            'edit_name':    f"{cat}/{setting}",
+            'prompt':       prompt,
+        }
 
     def __getitem__(self, idx):
-        edit_name, stems = random.choice(self.styles)
-        # Pick 2 different stems: first → A/A', second → B/B'
-        (a_path, a_prime_path, a_edit1, a_edit2), (b_path,
-                                                   b_prime_path, b_edit1, b_edit2) = random.sample(stems, 2)
-        pair_a = {"edit1": a_edit1, "edit2": a_edit2}
-        pair_b = {"edit1": b_edit1, "edit2": b_edit2}
-        if self.mode == "grid":
-            combined_prompt = (
-                "This is a 2x2 grid image. "
-                "Top-left is A, top-right is A', bottom-left is B, bottom-right is B'. "
-                f"Edit 1 (A to A'): {pair_a['edit1']}. {pair_a['edit2']}. "
-                f"Edit 1 (B to B'): {pair_b['edit1']}. {pair_b['edit2']}. "
-                "Treat the grid as two edit pairs: A to A' and B to B'."
-            )
-        else:
-            combined_prompt = (
-                "Image 1 is the original and image 2 is the edited version. "
-                f"Edit 1: {pair_a['edit1']}. Edit 2: {pair_a['edit2']}. "
-                "Apply the same edits to image 3 to produce the output."
-            )
+        # 1. Category (uniform)
+        cat = random.choice(self.cat_names)
+        settings = self.categories[cat]
 
-        # 10 % null-conditioning drop for classifier-free guidance training.
-        # An empty string causes the text encoder to produce an unconditional
-        # embedding, teaching the model to also generate without text guidance.
+        # 2. Setting (uniform)
+        setting = random.choice(list(settings.keys()))
+        samples = settings[setting]
+
+        # 3. Two distinct data items
+        sample_a, sample_b = random.sample(samples, 2)
+        data_dir_a, combined_a, prompt_a = sample_a
+        data_dir_b, combined_b, prompt_b = sample_b
+
+        # 4. Intersect available combined edit-index sets
+        map_a = {frozenset(idx): fn for fn, idx in combined_a}
+        map_b = {frozenset(idx): fn for fn, idx in combined_b}
+        common = set(map_a) & set(map_b)
+
+        if common:
+            pool = [(map_a[k], sorted(k)) for k in common]
+            fname_a, indices = _sample_combined(pool)
+            fname_b = map_b[frozenset(indices)]
+
+        # 5. Load images
+        a       = Image.open(data_dir_a / 'input.png').convert('RGB')
+        a_prime = Image.open(data_dir_a / fname_a).convert('RGB')
+        b       = Image.open(data_dir_b / 'input.png').convert('RGB')
+        b_prime = Image.open(data_dir_b / fname_b).convert('RGB')
+        a, a_prime, b, b_prime = harmonize_images(a, a_prime, b, b_prime)
+
+        # 6. Build prompt; 10 % null-conditioning drop
+        combined_prompt = _build_prompt_from_indices(indices, prompt_a)
         if random.random() < 0.1:
             combined_prompt = ""
 
-        a = Image.open(a_path).convert('RGB')
-        a_prime = Image.open(a_prime_path).convert('RGB')
-        b = Image.open(b_path).convert('RGB')
-        b_prime = Image.open(b_prime_path).convert('RGB')
-        a, a_prime, b, b_prime = harmonize_images(a, a_prime, b, b_prime)
         return {
-            'A': a,
-            'A_prime': a_prime,
-            'B': b,
-            'B_prime': b_prime,
-            'edit_name': edit_name,
-            'prompt': combined_prompt,
+            'A':         a,
+            'A_prime':   a_prime,
+            'B':         b,
+            'B_prime':   b_prime,
+            'edit_name': f"{cat}/{setting}",
+            'prompt':    combined_prompt,
         }
 
 
@@ -494,39 +631,18 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
     pipe = pipeline
     device = accelerator.device
     dtype = torch.bfloat16
-    mode = getattr(args, 'analogy_mode', 'concat')
 
-    # Pick a fresh random sample each validation
-    val_sample = random.choice(train_dataset.styles)
-    edit_name, stems = val_sample
-    (a_path, a_prime_path, a_edit1, a_edit2), (b_path,
-                                               b_prime_path, b_edit1, b_edit2) = random.sample(stems, 2)
-    pair_a = {"edit1": a_edit1, "edit2": a_edit2}
-    pair_b = {"edit1": b_edit1, "edit2": b_edit2}
-
-    if mode == "grid":
-        combined_prompt = (
-            "This is a 2x2 grid image. "
-            "Top-left is A, top-right is A', bottom-left is B, bottom-right is B'. "
-            f"Edit 1 (A to A'): {pair_a['edit1']}. {pair_a['edit2']}. "
-            f"Edit 1 (B to B'): {pair_b['edit1']}. {pair_b['edit2']}. "
-            "Treat the grid as two edit pairs: A to A' and B to B'."
-        )
-    else:
-        combined_prompt = (
-            "Image 1 is the original and image 2 is the edited version. "
-            f"Edit 1: {pair_a['edit1']}. Edit 2: {pair_a['edit2']}. "
-            "Apply the same edits to image 3 to produce the output."
-        )
-
+    # Pick a fresh random sample each validation via dataset helper
+    vp = train_dataset.sample_val_pair()
     val_sample = {
-        'A': Image.open(a_path).convert('RGB'),
-        'A_prime': Image.open(a_prime_path).convert('RGB'),
-        'B': Image.open(b_path).convert('RGB'),
-        'B_prime': Image.open(b_prime_path).convert('RGB'),
-        'edit_name': edit_name,
-        'prompt': combined_prompt,
+        'A':        Image.open(vp['a_path']).convert('RGB'),
+        'A_prime':  Image.open(vp['a_prime_path']).convert('RGB'),
+        'B':        Image.open(vp['b_path']).convert('RGB'),
+        'B_prime':  Image.open(vp['b_prime_path']).convert('RGB'),
+        'edit_name': vp['edit_name'],
+        'prompt':    vp['prompt'],
     }
+    combined_prompt = vp['prompt']
 
     # Encode images through VAE
     lat_a = encode_single_image(pipe, val_sample['A'])
@@ -556,82 +672,43 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
     num_inference_steps = args.num_val_inference_steps
     sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
 
-    if mode == "grid":
-        # Single grid: A, A', B are clean conditions; B' starts as noise
-        top_row = torch.cat([lat_a, lat_a_prime], dim=3)
-        bot_row = torch.cat([lat_b, lat_b.clone()], dim=3)
-        grid = torch.cat([top_row, bot_row], dim=2)
-        packed_h, packed_w = grid.shape[2], grid.shape[3]
+    # Concat mode: denoise single B' image from noise
+    patch_h, patch_w = lat_a.shape[2], lat_a.shape[3]
 
-        gen_latents = Flux2KleinPipeline._pack_latents(grid)
-        bp_mask = create_b_prime_mask(packed_h, packed_w).to(device)
-        clean_non_bp = gen_latents[:, ~bp_mask].clone()
-        gen_latents[:, bp_mask] = torch.randn_like(gen_latents[:, bp_mask])
+    cond_a = Flux2KleinPipeline._pack_latents(lat_a)
+    cond_ap = Flux2KleinPipeline._pack_latents(lat_a_prime)
+    cond_b = Flux2KleinPipeline._pack_latents(lat_b)
+    condition_latents = torch.cat([cond_a, cond_ap, cond_b], dim=1)
 
-        combined_ids = create_grid_condition_ids(packed_h, packed_w).to(device)
+    gen_latents = torch.randn(lat_a.shape, device=device, dtype=dtype)
+    gen_latents = Flux2KleinPipeline._pack_latents(gen_latents)
 
-        image_seq_len = gen_latents.shape[1]
-        mu = compute_empirical_mu(image_seq_len, num_inference_steps)
-        timesteps, _ = retrieve_timesteps(
-            pipe.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
+    target_ids = Flux2KleinPipeline._prepare_latent_ids(lat_a).to(device)
+    condition_ids = Flux2KleinPipeline._prepare_image_ids(
+        [lat_a, lat_a_prime, lat_b]).to(device)
+    combined_ids = torch.cat([target_ids, condition_ids], dim=1)
 
-        for t in timesteps:
-            noise_pred = pipe.transformer(
-                hidden_states=gen_latents,
-                timestep=t.expand(1).to(dtype) / 1000,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=combined_ids,
-                return_dict=False,
-            )[0]
-            gen_latents = pipe.scheduler.step(
-                noise_pred, t, gen_latents, return_dict=False)[0]
-            gen_latents[:, ~bp_mask] = clean_non_bp  # keep non-B' clean
+    image_seq_len = gen_latents.shape[1]
+    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+    timesteps, _ = retrieve_timesteps(
+        pipe.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
 
-        # Decode full grid, crop B' (bottom-right quadrant)
-        decoded_grid = decode_latents(gen_latents, packed_h, packed_w)
-        grid_w, grid_h = decoded_grid.size
-        pred_b_prime = decoded_grid.crop(
-            (grid_w // 2, grid_h // 2, grid_w, grid_h))
-    else:
-        # Concat mode: denoise single B' image from noise
-        patch_h, patch_w = lat_a.shape[2], lat_a.shape[3]
+    for t in timesteps:
+        latent_model_input = torch.cat(
+            [gen_latents, condition_latents], dim=1)
+        noise_pred = pipe.transformer(
+            hidden_states=latent_model_input,
+            timestep=t.expand(1).to(dtype) / 1000,
+            guidance=guidance,
+            encoder_hidden_states=prompt_embeds,
+            txt_ids=text_ids,
+            img_ids=combined_ids,
+            return_dict=False,
+        )[0][:, :gen_latents.shape[1]]
+        gen_latents = pipe.scheduler.step(
+            noise_pred, t, gen_latents, return_dict=False)[0]
 
-        cond_a = Flux2KleinPipeline._pack_latents(lat_a)
-        cond_ap = Flux2KleinPipeline._pack_latents(lat_a_prime)
-        cond_b = Flux2KleinPipeline._pack_latents(lat_b)
-        condition_latents = torch.cat([cond_a, cond_ap, cond_b], dim=1)
-
-        gen_latents = torch.randn(lat_a.shape, device=device, dtype=dtype)
-        gen_latents = Flux2KleinPipeline._pack_latents(gen_latents)
-
-        target_ids = Flux2KleinPipeline._prepare_latent_ids(lat_a).to(device)
-        condition_ids = Flux2KleinPipeline._prepare_image_ids(
-            [lat_a, lat_a_prime, lat_b]).to(device)
-        combined_ids = torch.cat([target_ids, condition_ids], dim=1)
-
-        image_seq_len = gen_latents.shape[1]
-        mu = compute_empirical_mu(image_seq_len, num_inference_steps)
-        timesteps, _ = retrieve_timesteps(
-            pipe.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
-
-        for t in timesteps:
-            latent_model_input = torch.cat(
-                [gen_latents, condition_latents], dim=1)
-            noise_pred = pipe.transformer(
-                hidden_states=latent_model_input,
-                timestep=t.expand(1).to(dtype) / 1000,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=combined_ids,
-                return_dict=False,
-            )[0][:, :gen_latents.shape[1]]
-            gen_latents = pipe.scheduler.step(
-                noise_pred, t, gen_latents, return_dict=False)[0]
-
-        pred_b_prime = decode_latents(gen_latents, patch_h, patch_w)
+    pred_b_prime = decode_latents(gen_latents, patch_h, patch_w)
 
     # Condition images from val_sample (shown once, not repeated)
     cell_size = 512

@@ -5,7 +5,7 @@ output_dir: "/workspace/visual_analogy/experiments/gated_moe_lora_flux2_klein_an
 
 pretrained_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
 
-data_root: "/workspace/visual_analogy/data"
+data_root: "/workspace/SIA_Dataset_creation/datasets/SIA_datasets/train"
 
 seed: 0
 checkpointing_steps: 500
