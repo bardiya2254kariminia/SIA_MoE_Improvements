@@ -776,11 +776,7 @@ def parse_args(print_args=False):
     args = OmegaConf.load(cli.config)
 
     # CLI --use_MoE overrides the YAML value
-    if cli.use_MoE:
-        args.use_MoE = True
-    elif not hasattr(args, "use_MoE"):
-        args.use_MoE = False
-
+    args.use_MoE = True
     if print_args:
         print("="*40, "Arguments", "="*40)
         for arg in args:

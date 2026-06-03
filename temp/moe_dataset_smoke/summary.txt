@@ -1,0 +1,15 @@
+MoE ImageAnalogyDataset smoke test — PASSED
+
+data_root      : /workspace/SIA_Dataset_creation/datasets/SIA_datasets/train
+out_root       : /workspace/SIA_MoE_Improvements/temp/moe_dataset_smoke
+dataset length : 121
+categories     : ['2edits_non_creature', '3_edits', '3edits_non_creature', '4edits']
+getitem samples: 5
+
+val_pair:
+  edit_name   : 2edits_non_creature/setting3
+  prompt      : Image 1 is the original and image 2 is the edited version. Edit 1: floating pose. Edit 2: add colored comic style. Apply the same edits to image 3 to produce the output.
+  a_path      : /workspace/SIA_Dataset_creation/datasets/SIA_datasets/train/2edits_non_creature/setting3/data4/input.png
+  a_prime_path: /workspace/SIA_Dataset_creation/datasets/SIA_datasets/train/2edits_non_creature/setting3/data4/combined12.png
+  b_path      : /workspace/SIA_Dataset_creation/datasets/SIA_datasets/train/2edits_non_creature/setting3/data5/input.png
+  b_prime_path: /workspace/SIA_Dataset_creation/datasets/SIA_datasets/train/2edits_non_creature/setting3/data5/combined12.png

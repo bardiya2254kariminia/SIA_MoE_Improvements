@@ -1,0 +1,14 @@
+{
+  "edit_name": "2edits_non_creature/setting1",
+  "prompt": "Image 1 is the original and image 2 is the edited version. Edit 1: turned-on front lights. Edit 2: open the front doors. Apply the same edits to image 3 to produce the output.",
+  "pair_a_edits": [
+    "turned-on front lights",
+    "open the front doors"
+  ],
+  "pair_b_edits": [
+    "turned-on front lights",
+    "open the front doors"
+  ],
+  "suppress_index": 1,
+  "suppressed_edit": "open the front doors"
+}
