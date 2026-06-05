@@ -252,11 +252,11 @@ def _tier_probs(n_tiers: int) -> list:
     if n_tiers <= 1:
         return [1.0] * max(n_tiers, 1)
     if n_tiers == 2:
-        return [0.70, 0.30]
+        return [0.90, 0.10]
     if n_tiers == 3:
-        return [0.70, 0.20, 0.10]
+        return [0.80, 0.10, 0.10]
     tail = 0.10 / (n_tiers - 2)
-    return [0.70, 0.20] + [tail] * (n_tiers - 2)
+    return [0.80, 0.10] + [tail] * (n_tiers - 2)
 
 
 def _sample_combined(combined_files: list):
