@@ -182,22 +182,24 @@ def load_pipeline(args, device):
         print(f"[MoE LoRA] Injected {len(n_moe)} TokenWiseGatedMoELoraLinear modules: "
               f"{list(n_moe)}")
 
-    # ---- Load base LoRA weights: auto-detect custom (.pt) vs PEFT safetensors ----
-    _custom_ckpt  = os.path.join(args.base_lora_path, "base_lora.pt")
+    # ---- Load base LoRA weights into the custom BaseLoRALinear modules ----
+    # Stage-1 now always saves the base LoRA as a PEFT adapter, so PEFT is the
+    # primary loader; the custom base_lora.pt is a legacy fallback.
     _peft_sf_ckpt = os.path.join(args.base_lora_path, "pytorch_lora_weights.safetensors")
     _peft_bin_ckpt= os.path.join(args.base_lora_path, "pytorch_lora_weights.bin")
+    _custom_ckpt  = os.path.join(args.base_lora_path, "base_lora.pt")
 
-    if os.path.exists(_custom_ckpt):
-        print(f"[Base LoRA] Loading custom format from {_custom_ckpt}")
-        load_base_lora_state_dict(transformer, _custom_ckpt, device="cpu")
-    elif os.path.exists(_peft_sf_ckpt) or os.path.exists(_peft_bin_ckpt):
+    if os.path.exists(_peft_sf_ckpt) or os.path.exists(_peft_bin_ckpt):
         print(f"[Base LoRA] Loading PEFT format from {args.base_lora_path}")
         load_base_lora_from_peft_checkpoint(transformer, args.base_lora_path, device="cpu")
+    elif os.path.exists(_custom_ckpt):
+        print(f"[Base LoRA] Loading legacy custom format from {_custom_ckpt}")
+        load_base_lora_state_dict(transformer, _custom_ckpt, device="cpu")
     else:
         raise FileNotFoundError(
             f"[Base LoRA] No checkpoint found in '{args.base_lora_path}'.\n"
-            f"  Expected 'base_lora.pt' (custom) or "
-            f"'pytorch_lora_weights.safetensors' (PEFT)."
+            f"  Expected 'pytorch_lora_weights.safetensors' (PEFT) or "
+            f"'base_lora.pt' (legacy custom)."
         )
 
     # ---- Load MoE weights from the base_lora_path (if use_MoE) ----

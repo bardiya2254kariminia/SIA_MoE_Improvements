@@ -71,17 +71,10 @@ except Exception:
     pass
 # ───────────────────────────────────────────────────────────────────────────
 
-from visual_analogy.models.selective_lora import BaseLoRALinear
 from visual_analogy.models.moe_lora import TokenWiseGatedMoELoraLinear
-from visual_analogy.utils.selective_lora import (
-    inject_base_lora_modules,
-    save_base_lora_state_dict,
-    collect_base_lora_params,
-)
 from visual_analogy.utils.moe_lora import (
     inject_moe_lora_modules,
     save_moe_lora_state_dict,
-    collect_moe_lora_params,
     collect_moe_aux_losses,
 )
 
@@ -838,59 +831,72 @@ def main():
     moe_aux_loss_weight = float(getattr(args, "moe_aux_loss_weight", 0.005))
 
 
-    print(f"[MoE LoRA] Enabled — targets: {moe_target_modules}, "
-            f"experts={num_experts}, rank={moe_lora_rank}, top_k={moe_top_k}")
+    print(f"[Stage 1] use_MoE={use_moe}")
 
-    # ---- Base LoRA: inject BaseLoRALinear on all modules EXCEPT MoE targets ----
-    base_only_modules = [
-        m for m in LORA_TARGET_MODULES_ALL
-        if not any(m.endswith(sfx) for sfx in moe_target_modules)
-    ]
-    base_replaced = inject_base_lora_modules(
-        transformer, base_only_modules,
-        r=args.lora_rank, alpha=args.lora_rank,
-        dropout=getattr(args, "lora_dropout", 0.0),
-    )
-    print(f"[Base LoRA] Injected {len(base_replaced)} BaseLoRALinear modules")
+    # ---- Base LoRA via PEFT add_lora (same as train_simple_lora reference) ----
+    # When MoE is enabled, PEFT targets every base module EXCEPT the MoE targets,
+    # leaving those as plain nn.Linear so inject_moe_lora_modules() can wrap them.
+    # PEFT wraps each target nn.Linear with its own lora.Linear; weights are saved
+    # as pytorch_lora_weights.safetensors via get_peft_model_state_dict().
+    if use_moe:
+        peft_base_modules = [
+            m for m in LORA_TARGET_MODULES_ALL
+            if not any(m.endswith(sfx) for sfx in moe_target_modules)
+        ]
+    else:
+        peft_base_modules = list(LORA_TARGET_MODULES_ALL)
 
-    # ---- MoE LoRA: injected on the remaining target layers ----
-    moe_replaced = inject_moe_lora_modules(
-        transformer, moe_target_modules,
-        num_experts=num_experts,
-        r=moe_lora_rank,
-        lora_alpha=moe_lora_alpha,
-        lora_dropout=getattr(args, "lora_dropout", 0.0),
-        top_k=moe_top_k,
-    )
-    print(f"[MoE LoRA] Injected {len(moe_replaced)} TokenWiseGatedMoELoraLinear modules:")
-    for name in moe_replaced:
-        print(f"  {name}")
+    args.lora_name = getattr(args, "lora_name", "visual-analogy-gstlora")
+    add_lora(transformer, args, peft_base_modules)
+    print(f"[Base LoRA] PEFT adapter '{args.lora_name}' added to "
+          f"{len(peft_base_modules)} modules: {peft_base_modules}")
 
-    # ---- Save hook: base_lora.pt + moe_lora.pt ----
-    def _save_moe_hook(models, weights, output_dir):
+    # ---- MoE LoRA: injected AFTER PEFT so the MoE targets are still plain nn.Linear ----
+    if use_moe:
+        moe_replaced = inject_moe_lora_modules(
+            transformer, moe_target_modules,
+            num_experts=num_experts,
+            r=moe_lora_rank,
+            lora_alpha=moe_lora_alpha,
+            lora_dropout=getattr(args, "lora_dropout", 0.0),
+            top_k=moe_top_k,
+        )
+        print(f"[MoE LoRA] Injected {len(moe_replaced)} TokenWiseGatedMoELoraLinear modules:")
+        for name in moe_replaced:
+            print(f"  {name}")
+
+    # ---- Save hook: PEFT safetensors (base LoRA) + moe_lora.pt (custom MoE) ----
+    # Base LoRA is saved exactly like train_simple_lora (PEFT format), so Stage 2
+    # and infer_single can load it with load_base_lora_from_peft_checkpoint().
+    def _save_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             for model in models:
                 unwrapped = accelerator.unwrap_model(model)
                 if isinstance(unwrapped, Flux2Transformer2DModel):
-                    save_base_lora_state_dict(
-                        unwrapped,
-                        os.path.join(output_dir, "base_lora.pt"),
+                    Flux2KleinPipeline.save_lora_weights(
+                        output_dir,
+                        transformer_lora_layers=get_peft_model_state_dict(
+                            unwrapped, adapter_name=args.lora_name),
                     )
-                    save_moe_lora_state_dict(
-                        unwrapped,
-                        os.path.join(output_dir, "moe_lora.pt"),
-                    )
+                    if use_moe:
+                        save_moe_lora_state_dict(
+                            unwrapped,
+                            os.path.join(output_dir, "moe_lora.pt"),
+                        )
                     weights.pop()
+                else:
+                    raise ValueError(f"Wrong model supplied: {type(unwrapped)=}.")
 
-    accelerator.register_save_state_pre_hook(_save_moe_hook)
+    accelerator.register_save_state_pre_hook(_save_hook)
 
     cast_training_params([transformer], dtype=torch.float32)
 
-    # ---- Optimizer: BaseLoRALinear params + MoE gate/expert params ----
-    base_lora_params = collect_base_lora_params(transformer)
-    moe_params       = collect_moe_lora_params(transformer)
-    all_trainable    = base_lora_params + moe_params
-    print(f"[Optimizer] base LoRA params: {len(base_lora_params)}, MoE params: {len(moe_params)}")
+    # ---- Optimizer: PEFT adapter params + MoE gate/expert params ----
+    # add_lora() leaves PEFT lora_A/lora_B with requires_grad=True, and
+    # inject_moe_lora_modules() leaves the gate/experts trainable; the base
+    # transformer weights stay frozen, so this single filter captures both.
+    all_trainable = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+    print(f"[Optimizer] trainable tensors: {len(all_trainable)}")
 
     optimizer = torch.optim.AdamW(
         [{"params": all_trainable, "lr": args.learning_rate}],
@@ -1041,6 +1047,7 @@ def main():
                     latent_model_input = noisy_model_input
 
                 # Get the models ouput for B'(in the grid mode, the whole grid but loss only on B' via masking)
+                transformer.set_adapters([args.lora_name], [1])
                 model_pred = transformer(
                     hidden_states=latent_model_input,
                     timestep=timesteps / 1000,

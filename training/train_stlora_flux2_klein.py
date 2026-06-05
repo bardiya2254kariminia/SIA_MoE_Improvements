@@ -1301,36 +1301,35 @@ def main():
         for name in moe_replaced:
             print(f"  {name}")
 
-    # Load pre-trained base LoRA weights 
-    # Two possible Stage-1 checkpoint formats:
+    # Load pre-trained base LoRA weights into the custom BaseLoRALinear modules.
+    # Stage-1 (train_gated_moe_lora_flux2_klein.py / train_simple_lora) now always
+    # saves the base LoRA as a PEFT adapter, so the PEFT path is primary:
     #
-    #   A) Custom format  (train_gated_moe_lora_flux2_klein.py with use_MoE=True)
-    #      checkpoint-N/base_lora.pt   ← BaseLoRALinear weights
-    #      checkpoint-N/moe_lora.pt    ← TokenWiseGatedMoELoraLinear weights
-    #      → load with load_base_lora_state_dict()
-    #
-    #   B) PEFT format  (train_simple_lora_flux2_klein.py with use_MoE=False)
+    #   A) PEFT format  (primary — every Stage-1 run, MoE or not)
     #      checkpoint-N/pytorch_lora_weights.safetensors
     #      → load with load_base_lora_from_peft_checkpoint()
+    #      (MoE weights, if any, are in checkpoint-N/moe_lora.pt — loaded below)
     #
-    # Custom format takes priority; PEFT is a fallback for non-MoE Stage-1 runs.
+    #   B) Custom format  (legacy fallback for old pre-PEFT Stage-1 checkpoints)
+    #      checkpoint-N/base_lora.pt
+    #      → load with load_base_lora_state_dict()
     # ---------------------------------------------------------------------------------
-    _custom_base_ckpt = os.path.join(args.base_lora_path, "base_lora.pt")
     _peft_sf_ckpt     = os.path.join(args.base_lora_path, "pytorch_lora_weights.safetensors")
     _peft_bin_ckpt    = os.path.join(args.base_lora_path, "pytorch_lora_weights.bin")
+    _custom_base_ckpt = os.path.join(args.base_lora_path, "base_lora.pt")
 
-    if os.path.exists(_custom_base_ckpt):
-        print(f"[Base LoRA] Detected custom format checkpoint, loading from {_custom_base_ckpt}")
-        load_base_lora_state_dict(transformer, _custom_base_ckpt, device="cpu")
-    elif os.path.exists(_peft_sf_ckpt) or os.path.exists(_peft_bin_ckpt):
+    if os.path.exists(_peft_sf_ckpt) or os.path.exists(_peft_bin_ckpt):
         print(f"[Base LoRA] Detected PEFT format checkpoint, loading from {args.base_lora_path}")
         load_base_lora_from_peft_checkpoint(transformer, args.base_lora_path, device="cpu")
+    elif os.path.exists(_custom_base_ckpt):
+        print(f"[Base LoRA] Detected legacy custom format checkpoint, loading from {_custom_base_ckpt}")
+        load_base_lora_state_dict(transformer, _custom_base_ckpt, device="cpu")
     else:
         raise FileNotFoundError(
             f"[Base LoRA] No recognised checkpoint found in '{args.base_lora_path}'.\n"
             f"  Expected one of:\n"
-            f"    {_custom_base_ckpt}  (from train_gated_moe_lora_flux2_klein.py)\n"
-            f"    {_peft_sf_ckpt}  (from train_simple_lora_flux2_klein.py)\n"
+            f"    {_peft_sf_ckpt}  (PEFT format — any Stage-1 trainer)\n"
+            f"    {_custom_base_ckpt}  (legacy custom format)\n"
             f"  Point base_lora_path at the checkpoint-N directory, not its parent."
         )
 
