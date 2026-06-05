@@ -24,7 +24,7 @@ export WANDB_API_KEY="your_wandb_key"   # optional, for logging
 ### Installation
 
 ```bash
-conda env create -f environment.yml
+    conda env create -f environment.yml
 conda activate visual_analogy
 pip install -e .
 ```
